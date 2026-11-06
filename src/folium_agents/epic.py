@@ -4,19 +4,20 @@ import base64
 import hashlib
 import hmac
 import secrets
+import time
 from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urlencode
 
 import httpx
+import jwt
+from cryptography.hazmat.primitives.serialization import load_pem_private_key
 from pydantic import BaseModel, ConfigDict, Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-DEFAULT_EPIC_FHIR_ISSUER = (
-    "https://fhir.epic.com/interconnect-fhir-oauth/api/FHIR/R4"
-)
-DEFAULT_EPIC_SCOPE = "openid fhirUser launch user/CarePlan.rs"
-MAX_CARE_PLAN_COUNT = 20
+DEFAULT_EPIC_FHIR_ISSUER = "https://fhir.epic.com/interconnect-fhir-oauth/api/FHIR/R4"
+DEFAULT_EPIC_SCOPE = "openid fhirUser user/Patient.rs"
+MAX_PATIENT_COUNT = 20
 
 
 class EpicConfig(BaseSettings):
@@ -32,8 +33,15 @@ class EpicConfig(BaseSettings):
     redirect_uri: str
     client_secret: SecretStr | None = None
     token_auth_method: Literal[
-        "none", "client_secret_post", "client_secret_basic"
-    ] = "none"
+        "none",
+        "client_secret_post",
+        "client_secret_basic",
+        "private_key_jwt",
+    ] = "private_key_jwt"
+    private_key_path: Path | None = None
+    private_key_id: str | None = None
+    private_key_passphrase: SecretStr | None = None
+    private_key_algorithm: Literal["RS384", "ES384"] = "RS384"
     scope: str = DEFAULT_EPIC_SCOPE
     issuer: str = DEFAULT_EPIC_FHIR_ISSUER
 
@@ -64,6 +72,47 @@ class CarePlanSummary(BaseModel):
     status: str | None = None
     subject: dict[str, Any] | None = None
     encounter: dict[str, Any] | None = None
+
+
+class EpicPatientName(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    family: str = ""
+    given: list[str] = Field(default_factory=list)
+
+
+class EpicPatient(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    resource_type: Literal["Patient"] = Field(alias="resourceType")
+    id: str
+    name: list["EpicPatientName"] = Field(default_factory=list)
+
+    @property
+    def display_name(self) -> str:
+        for patient_name in self.name:
+            parts = [*patient_name.given, patient_name.family]
+            display_name = " ".join(part for part in parts if part)
+            if display_name:
+                return display_name
+        return "(name unavailable)"
+
+
+class PatientBundleEntry(BaseModel):
+    resource: EpicPatient
+
+
+class EpicPatientSearchResult(BaseModel):
+    total: int | None = None
+    patients: list[EpicPatient]
+
+
+class EpicPatientBundle(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    resource_type: Literal["Bundle"] = Field(alias="resourceType")
+    total: int | None = None
+    entry: list[PatientBundleEntry] = Field(default_factory=list)
 
 
 class EpicSmartClient:
@@ -162,6 +211,12 @@ class EpicSmartClient:
             )
             encoded = base64.b64encode(credentials.encode()).decode("ascii")
             headers["Authorization"] = f"Basic {encoded}"
+        elif auth_method == "private_key_jwt":
+            assertion = self._create_client_assertion(smart.token_endpoint)
+            form_data["client_assertion_type"] = (
+                "urn:ietf:params:oauth:client-assertion-type:jwt-bearer"
+            )
+            form_data["client_assertion"] = assertion
 
         response = await self._request(
             "POST",
@@ -171,6 +226,68 @@ class EpicSmartClient:
         )
         response.raise_for_status()
         return EpicToken.model_validate(response.json())
+
+    def _create_client_assertion(self, token_endpoint: str) -> str:
+        config = self._config
+        if config.private_key_path is None:
+            raise ValueError("EPIC_PRIVATE_KEY_PATH is required for private_key_jwt.")
+        if not config.private_key_path.is_file():
+            raise ValueError("The configured Epic private-key file does not exist.")
+
+        private_key_bytes = config.private_key_path.read_bytes()
+        passphrase = (
+            config.private_key_passphrase.get_secret_value().encode()
+            if config.private_key_passphrase
+            else None
+        )
+        private_key = load_pem_private_key(private_key_bytes, password=passphrase)
+        now = int(time.time())
+        claims = {
+            "iss": config.client_id,
+            "sub": config.client_id,
+            "aud": token_endpoint,
+            "iat": now,
+            "exp": now + 300,
+            "jti": secrets.token_urlsafe(24),
+        }
+        headers = {"typ": "JWT"}
+        if config.private_key_id:
+            headers["kid"] = config.private_key_id
+        return jwt.encode(
+            claims,
+            private_key,
+            algorithm=config.private_key_algorithm,
+            headers=headers,
+        )
+
+    async def search_patients(
+        self,
+        access_token: str,
+        *,
+        limit: int = 10,
+        issuer: str | None = None,
+    ) -> EpicPatientSearchResult:
+        if not access_token:
+            raise ValueError("An access token is required.")
+        if not 1 <= limit <= MAX_PATIENT_COUNT:
+            raise ValueError(f"limit must be between 1 and {MAX_PATIENT_COUNT}.")
+
+        base_url = (issuer or self._config.issuer).rstrip("/")
+        response = await self._request(
+            "GET",
+            f"{base_url}/Patient",
+            params={"_count": limit, "_elements": "id,name"},
+            headers={
+                "Accept": "application/fhir+json",
+                "Authorization": f"Bearer {access_token}",
+            },
+        )
+        response.raise_for_status()
+        bundle = EpicPatientBundle.model_validate(response.json())
+        return EpicPatientSearchResult(
+            total=bundle.total,
+            patients=[entry.resource for entry in bundle.entry],
+        )
 
     async def get_care_plan(
         self,
