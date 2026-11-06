@@ -11,19 +11,21 @@ from urllib.parse import urlencode
 
 import httpx
 import jwt
+import keyring
 from cryptography.hazmat.primitives.serialization import load_pem_private_key
 from pydantic import BaseModel, ConfigDict, Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 DEFAULT_EPIC_FHIR_ISSUER = "https://fhir.epic.com/interconnect-fhir-oauth/api/FHIR/R4"
 DEFAULT_EPIC_SCOPE = "openid fhirUser user/Patient.rs"
-MAX_PATIENT_COUNT = 20
+TOKEN_KEYRING_SERVICE = "folium-agents-epic"
+TOKEN_EXPIRY_SKEW_SECONDS = 30
 
 
 class EpicConfig(BaseSettings):
     model_config = SettingsConfigDict(
         env_prefix="EPIC_",
-        env_file=Path(__file__).resolve().parents[2] / ".env",
+        env_file=Path(__file__).resolve().parents[3] / ".env",
         env_file_encoding="utf-8",
         extra="ignore",
         frozen=True,
@@ -37,7 +39,7 @@ class EpicConfig(BaseSettings):
         "client_secret_post",
         "client_secret_basic",
         "private_key_jwt",
-    ] = "private_key_jwt"
+    ] = "none"
     private_key_path: Path | None = None
     private_key_id: str | None = None
     private_key_passphrase: SecretStr | None = None
@@ -56,12 +58,100 @@ class SmartConfiguration(BaseModel):
     code_challenge_methods_supported: list[str] = Field(default_factory=list)
 
 
+class CapabilitySearchParameter(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    name: str
+    type: str | None = None
+
+
+class CapabilityInteraction(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    code: str
+
+
+class CapabilityResource(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    resource_type: str = Field(alias="type")
+    interactions: list[CapabilityInteraction] = Field(
+        default_factory=list,
+        alias="interaction",
+    )
+    search_parameters: list[CapabilitySearchParameter] = Field(
+        default_factory=list,
+        alias="searchParam",
+    )
+
+
+class CapabilityRest(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    resources: list[CapabilityResource] = Field(default_factory=list, alias="resource")
+
+
+class FhirCapabilityStatement(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    resource_type: Literal["CapabilityStatement"] = Field(alias="resourceType")
+    rest: list[CapabilityRest] = Field(default_factory=list)
+
+
 class EpicToken(BaseModel):
     access_token: str
     token_type: str = "Bearer"
     expires_in: int | None = None
+    refresh_token: str | None = None
     patient: str | None = None
     encounter: str | None = None
+
+
+class CachedEpicToken(BaseModel):
+    token: EpicToken
+    expires_at: float
+
+    @property
+    def is_valid(self) -> bool:
+        return self.expires_at > time.time() + TOKEN_EXPIRY_SKEW_SECONDS
+
+
+class EpicTokenCache:
+    def __init__(self, config: EpicConfig) -> None:
+        self._account = hashlib.sha256(
+            f"{config.client_id}|{config.redirect_uri}|{config.issuer}".encode()
+        ).hexdigest()
+
+    def load(self) -> CachedEpicToken | None:
+        value = keyring.get_password(TOKEN_KEYRING_SERVICE, self._account)
+        if value is None:
+            return None
+        try:
+            return CachedEpicToken.model_validate_json(value)
+        except ValueError:
+            self.clear()
+            raise ValueError(
+                "The saved Epic token entry is invalid and has been removed. "
+                "Run the command again to authorize."
+            ) from None
+
+    def save(self, token: EpicToken) -> None:
+        if token.expires_in is None or token.expires_in <= 0:
+            self.clear()
+            return
+        cached = CachedEpicToken(
+            token=token,
+            expires_at=time.time() + token.expires_in,
+        )
+        keyring.set_password(
+            TOKEN_KEYRING_SERVICE,
+            self._account,
+            cached.model_dump_json(),
+        )
+
+    def clear(self) -> None:
+        if keyring.get_password(TOKEN_KEYRING_SERVICE, self._account) is not None:
+            keyring.delete_password(TOKEN_KEYRING_SERVICE, self._account)
 
 
 class CarePlanSummary(BaseModel):
@@ -146,6 +236,19 @@ class EpicSmartClient:
         response.raise_for_status()
         return SmartConfiguration.model_validate(response.json())
 
+    async def discover_fhir_capabilities(
+        self,
+        issuer: str | None = None,
+    ) -> FhirCapabilityStatement:
+        fhir_issuer = (issuer or self._config.issuer).rstrip("/")
+        response = await self._request(
+            "GET",
+            f"{fhir_issuer}/metadata",
+            headers={"Accept": "application/fhir+json"},
+        )
+        response.raise_for_status()
+        return FhirCapabilityStatement.model_validate(response.json())
+
     def build_authorization_url(
         self,
         smart: SmartConfiguration,
@@ -197,6 +300,51 @@ class EpicSmartClient:
             "code_verifier": code_verifier,
         }
         headers = {"Accept": "application/json"}
+        self._add_client_auth(form_data, headers, smart.token_endpoint)
+
+        response = await self._request(
+            "POST",
+            smart.token_endpoint,
+            data=form_data,
+            headers=headers,
+        )
+        response.raise_for_status()
+        return EpicToken.model_validate(response.json())
+
+    async def refresh_access_token(
+        self,
+        smart: SmartConfiguration,
+        refresh_token: str,
+    ) -> EpicToken:
+        if not refresh_token:
+            raise ValueError("A refresh token is required.")
+
+        form_data = {
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+            "client_id": self._config.client_id,
+        }
+        headers = {"Accept": "application/json"}
+        self._add_client_auth(form_data, headers, smart.token_endpoint)
+
+        response = await self._request(
+            "POST",
+            smart.token_endpoint,
+            data=form_data,
+            headers=headers,
+        )
+        response.raise_for_status()
+        token = EpicToken.model_validate(response.json())
+        if not token.refresh_token:
+            token.refresh_token = refresh_token
+        return token
+
+    def _add_client_auth(
+        self,
+        form_data: dict[str, str],
+        headers: dict[str, str],
+        token_endpoint: str,
+    ) -> None:
         auth_method = self._config.token_auth_method
         if auth_method == "client_secret_post":
             if not self._config.client_secret:
@@ -212,20 +360,11 @@ class EpicSmartClient:
             encoded = base64.b64encode(credentials.encode()).decode("ascii")
             headers["Authorization"] = f"Basic {encoded}"
         elif auth_method == "private_key_jwt":
-            assertion = self._create_client_assertion(smart.token_endpoint)
+            assertion = self._create_client_assertion(token_endpoint)
             form_data["client_assertion_type"] = (
                 "urn:ietf:params:oauth:client-assertion-type:jwt-bearer"
             )
             form_data["client_assertion"] = assertion
-
-        response = await self._request(
-            "POST",
-            smart.token_endpoint,
-            data=form_data,
-            headers=headers,
-        )
-        response.raise_for_status()
-        return EpicToken.model_validate(response.json())
 
     def _create_client_assertion(self, token_endpoint: str) -> str:
         config = self._config
@@ -264,30 +403,70 @@ class EpicSmartClient:
         self,
         access_token: str,
         *,
-        limit: int = 10,
+        patient_id: str,
         issuer: str | None = None,
     ) -> EpicPatientSearchResult:
         if not access_token:
             raise ValueError("An access token is required.")
-        if not 1 <= limit <= MAX_PATIENT_COUNT:
-            raise ValueError(f"limit must be between 1 and {MAX_PATIENT_COUNT}.")
+        patient_id = patient_id.strip()
+        if not patient_id:
+            raise ValueError("A Patient FHIR ID is required.")
 
         base_url = (issuer or self._config.issuer).rstrip("/")
         response = await self._request(
             "GET",
             f"{base_url}/Patient",
-            params={"_count": limit, "_elements": "id,name"},
+            params={"_id": patient_id},
             headers={
                 "Accept": "application/fhir+json",
                 "Authorization": f"Bearer {access_token}",
             },
         )
-        response.raise_for_status()
+        try:
+            response.raise_for_status()
+        except httpx.HTTPStatusError as error:
+            details = self._operation_outcome_details(response)
+            if details is None:
+                raise
+            raise httpx.HTTPStatusError(
+                f"{error}. Epic OperationOutcome: {details}",
+                request=error.request,
+                response=response,
+            ) from error
         bundle = EpicPatientBundle.model_validate(response.json())
         return EpicPatientSearchResult(
             total=bundle.total,
             patients=[entry.resource for entry in bundle.entry],
         )
+
+    @staticmethod
+    def _operation_outcome_details(response: httpx.Response) -> str | None:
+        try:
+            outcome = response.json()
+        except ValueError:
+            return None
+        if not isinstance(outcome, dict) or outcome.get("resourceType") != "OperationOutcome":
+            return None
+
+        issues = outcome.get("issue")
+        if not isinstance(issues, list):
+            return None
+
+        messages: list[str] = []
+        for issue in issues:
+            if not isinstance(issue, dict):
+                continue
+            details = issue.get("details")
+            text = details.get("text") if isinstance(details, dict) else None
+            diagnostics = issue.get("diagnostics")
+            if isinstance(text, str) and text.strip():
+                messages.append(text.strip())
+            if isinstance(diagnostics, str) and diagnostics.strip():
+                messages.append(diagnostics.strip())
+
+        if not messages:
+            return None
+        return " ".join(dict.fromkeys(messages))[:500]
 
     async def get_care_plan(
         self,

@@ -1,45 +1,37 @@
-# Folium Agents — Epic sandbox connector
+# Folium Agents
 
-This learning project tests an external, clinician-authorized connection to
-Epic's FHIR sandbox. The current proof requests a bounded list of synthetic
-sample patients using read-only `Patient` access. It does not write records or
-print access tokens.
+Folium Agents is an independent workspace for developing reusable agent
+workflows that can work with different electronic health record (EHR) systems.
+The project separates agent behavior from vendor-specific connectors, which
+own authentication, API calls, and mapping EHR data into stable agent-facing
+contracts.
 
-## Configure
+Connectors are developed and validated independently against authorized
+sandbox or synthetic data. They should use supported APIs, least-privilege
+access, preserve source provenance, and avoid writes unless a separately
+reviewed workflow explicitly requires them.
 
-Put these settings in the repository-root `.env` file. Keep the private key
-outside source control and use the exact callback URI registered for the Epic
-sandbox app.
+The harness core provides vendor-neutral agent capabilities and discovers
+optional modules through package entry points. Modules own their domain APIs,
+authentication, data mapping, and module-specific commands; the core does not
+import concrete EHR implementations.
 
-```dotenv
-EPIC_CLIENT_ID=your-sandbox-client-id
-EPIC_REDIRECT_URI=http://localhost:8765/callback
-EPIC_PRIVATE_KEY_PATH=/absolute/path/to/epic-private-key.pem
-EPIC_PRIVATE_KEY_ID=your-uploaded-key-id
-EPIC_TOKEN_AUTH_METHOD=private_key_jwt
-EPIC_SCOPE=openid fhirUser user/Patient.rs
-```
+## Project layout
 
-For an encrypted PEM, also set `EPIC_PRIVATE_KEY_PASSPHRASE`. `EPIC_FHIR_ISSUER`
-defaults to Epic's public R4 sandbox. The app registration must have the
-Patient read/search API enabled and the matching public key uploaded. Never
-commit the private key, passphrase, authorization code, or access token.
+- `src/folium_agents/cli.py` — shared command-line routing
+- `src/folium_agents/core/` — module contract and vendor-neutral runtime
+- `src/folium_agents/epic/` — Epic SMART/FHIR client, secure token cache, and CLI
+- `docs/epic-sandbox.md` — Epic sandbox setup and current proof
 
-## Run
+## Development
 
-From the repository root, run:
+Requires Python 3.11 or later and [uv](https://docs.astral.sh/uv/).
 
 ```bash
 uv sync
-uv run folium-agents --limit 10
+uv run pytest
+uv run ruff check .
 ```
 
-The CLI discovers Epic's SMART endpoints, opens the authorization URL in a
-browser, receives the response at the registered localhost callback, verifies
-OAuth state and PKCE, exchanges the code using a short-lived private-key JWT
-client assertion, and requests a maximum of 20 Patient IDs and names. The
-bearer token is held in memory and is not displayed.
-
-The sandbox contains synthetic test data. This does not authorize access to
-production systems; each Epic customer controls and approves its own
-connection.
+Connector-specific configuration and run instructions belong in their
+respective documentation so the project overview remains EHR-neutral.
