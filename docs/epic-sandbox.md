@@ -1,8 +1,10 @@
 # Epic sandbox connector
 
 The Epic adapter is the first external EHR connector proof. It uses SMART on
-FHIR authorization to list a bounded number of synthetic sandbox patients
-with read-only access. It does not write records or display bearer tokens.
+FHIR authorization for read-only access to synthetic sandbox data. Patient
+search requires an explicit FHIR ID; the adapter does not enumerate patients.
+The medication review is a chart-evidence summary, not a prediction or
+treatment recommendation.
 
 ## Configure
 
@@ -19,7 +21,18 @@ EPIC_SCOPE=openid fhirUser user/Patient.rs
 
 The default `none` method sends the client ID and PKCE verifier without a
 client secret or private key. Use the authentication method configured for
-your Epic app registration. The app must have Patient read/search enabled.
+your Epic app registration. The `patients` command requires Patient
+read/search. The `medication-review` command separately requests these
+patient-scoped SMART permissions:
+
+```text
+launch/patient patient/MedicationRequest.rs patient/AllergyIntolerance.rs patient/Condition.rs
+```
+
+The Epic app registration must enable these scopes and the standalone patient
+selection workflow. The command verifies that the Patient FHIR ID selected in
+the authorization flow matches `--patient-id` before requesting chart data.
+It refuses to produce a report if the context does not match.
 
 Private-key JWT is optional. To use it, upload your public key to the Epic app
 registration, then set `EPIC_TOKEN_AUTH_METHOD=private_key_jwt` and
@@ -35,6 +48,7 @@ From the repository root:
 uv sync
 uv run folium-agents epic discover
 uv run folium-agents epic patients --patient-id <FHIR_ID>
+uv run folium-agents epic medication-review --patient-id <FHIR_ID>
 ```
 
 `epic discover` also reads the FHIR CapabilityStatement at `<FHIR base>/metadata`
@@ -51,3 +65,21 @@ in the OS credential store and are never displayed by the CLI.
 The sandbox contains synthetic test data. This does not authorize access to
 production systems; each Epic customer controls and approves its own
 connection.
+
+## Medication review limits
+
+The medication review retrieves up to 100 patient-scoped `MedicationRequest`,
+`AllergyIntolerance`, and `Condition` entries and fails rather than presenting
+truncated results. It summarizes charted entries and flags only multiple
+active medication requests with the exact same coding system and code as
+possible duplicate records. The flag includes source resource IDs and requires
+clinician review; it does not establish a duplicate prescription or clinical
+risk. The command does not infer allergies, conditions, contraindications,
+drug interactions, or treatment changes. An empty result means no matching
+resource was returned, not that the patient has no such history. FHIR
+OperationOutcome warning codes are displayed without their diagnostic text;
+warnings can indicate omitted records, so the review may be incomplete.
+
+The required app-registration scopes and standalone selection behavior have
+not yet been verified against a live Epic sandbox launch. Offline tests do not
+establish sandbox or customer interoperability.

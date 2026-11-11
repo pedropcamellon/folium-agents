@@ -8,11 +8,13 @@ import pytest
 from pydantic import ValidationError
 
 from folium_agents.epic.epic import (
-    CachedEpicToken,
     EpicConfig,
     EpicSmartClient,
-    EpicToken,
     EpicTokenCache,
+)
+from folium_agents.epic.models import (
+    CachedEpicToken,
+    EpicToken,
     SmartConfiguration,
 )
 
@@ -258,6 +260,61 @@ def test_epic_token_cache_round_trips_only_through_keyring(
     assert records == {}
 
 
+def test_epic_token_cache_isolates_medication_review_scope_and_patient(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from folium_agents.epic import epic
+
+    records: dict[tuple[str, str], str] = {}
+    monkeypatch.setattr(
+        epic.keyring,
+        "get_password",
+        lambda service, account: records.get((service, account)),
+    )
+    monkeypatch.setattr(
+        epic.keyring,
+        "set_password",
+        lambda service, account, value: records.__setitem__(
+            (service, account),
+            value,
+        ),
+    )
+    monkeypatch.setattr(
+        epic.keyring,
+        "delete_password",
+        lambda service, account: records.pop((service, account)),
+    )
+    review_config = _epic_config(
+        client_id="sandbox-client",
+        redirect_uri="http://localhost:8765/callback",
+        scope="openid fhirUser launch/patient patient/MedicationRequest.rs",
+    )
+    other_scope_config = review_config.model_copy(update={"scope": "openid fhirUser"})
+    selected_patient_cache = EpicTokenCache(
+        review_config,
+        context_id="sample-001",
+    )
+    other_patient_cache = EpicTokenCache(
+        review_config,
+        context_id="sample-002",
+    )
+    other_scope_cache = EpicTokenCache(
+        other_scope_config,
+        context_id="sample-001",
+    )
+    selected_patient_cache.save(
+        EpicToken(
+            access_token="synthetic-access-token",
+            expires_in=600,
+            patient="sample-001",
+        )
+    )
+
+    assert selected_patient_cache.load() is not None
+    assert other_patient_cache.load() is None
+    assert other_scope_cache.load() is None
+
+
 def test_discover_fhir_capabilities_reads_metadata_endpoint() -> None:
     requests: list[httpx.Request] = []
 
@@ -273,7 +330,10 @@ def test_discover_fhir_capabilities_reads_metadata_endpoint() -> None:
                         "resource": [
                             {
                                 "type": "Patient",
-                                "interaction": [{"code": "read"}, {"code": "search-type"}],
+                                "interaction": [
+                                    {"code": "read"},
+                                    {"code": "search-type"},
+                                ],
                                 "searchParam": [
                                     {"name": "_id", "type": "token"},
                                     {"name": "family", "type": "string"},
@@ -394,8 +454,7 @@ def test_search_patients_requests_bounded_minimal_patient_data() -> None:
         assert len(requests) == 1
         assert requests[0].method == "GET"
         assert str(requests[0].url) == (
-            "https://epic.example.test/api/FHIR/R4/Patient"
-            "?_id=sample-001"
+            "https://epic.example.test/api/FHIR/R4/Patient?_id=sample-001"
         )
         assert requests[0].headers["Authorization"] == "Bearer synthetic-token"
 
@@ -440,13 +499,539 @@ def test_search_patients_includes_epic_operation_outcome_details() -> None:
     asyncio.run(run_test())
 
 
+def test_medication_review_returns_patient_scoped_evidence_and_duplicate_flags() -> (
+    None
+):
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path.endswith("/MedicationRequest"):
+            return httpx.Response(
+                200,
+                json={
+                    "resourceType": "Bundle",
+                    "type": "searchset",
+                    "total": 5,
+                    "entry": [
+                        {
+                            "resource": {
+                                "resourceType": "MedicationRequest",
+                                "id": "med-order-1",
+                                "status": "active",
+                                "authoredOn": "2026-01-02",
+                                "medicationCodeableConcept": {
+                                    "coding": [
+                                        {
+                                            "system": "http://www.nlm.nih.gov/research/umls/rxnorm",
+                                            "code": "12345",
+                                            "display": "Sample medication",
+                                        }
+                                    ]
+                                },
+                                "dosageInstruction": [{"text": "As recorded"}],
+                            }
+                        },
+                        {
+                            "resource": {
+                                "resourceType": "MedicationRequest",
+                                "id": "med-order-2",
+                                "status": "active",
+                                "medicationCodeableConcept": {
+                                    "coding": [
+                                        {
+                                            "system": "http://www.nlm.nih.gov/research/umls/rxnorm",
+                                            "code": "12345",
+                                            "display": "Sample medication",
+                                        }
+                                    ]
+                                },
+                            }
+                        },
+                        {
+                            "resource": {
+                                "resourceType": "MedicationRequest",
+                                "id": "med-order-3",
+                                "status": "active",
+                                "medicationCodeableConcept": {
+                                    "coding": [
+                                        {
+                                            "system": "http://www.nlm.nih.gov/research/umls/rxnorm",
+                                            "code": "67890",
+                                            "display": "Sample medication",
+                                        }
+                                    ]
+                                },
+                            }
+                        },
+                        {
+                            "resource": {
+                                "resourceType": "MedicationRequest",
+                                "id": "med-order-4",
+                                "status": "active",
+                                "medicationReference": {
+                                    "reference": "Medication/sample-medication",
+                                    "display": "Sample medication",
+                                },
+                                "dosageInstruction": None,
+                            }
+                        },
+                        {
+                            "resource": {
+                                "resourceType": "MedicationRequest",
+                                "id": "med-order-5",
+                                "status": "active",
+                                "medicationCodeableConcept": {
+                                    "text": "Uncoded medication",
+                                    "coding": None,
+                                },
+                                "dosageInstruction": None,
+                            }
+                        },
+                        {
+                            "resource": {
+                                "resourceType": "OperationOutcome",
+                                "issue": [
+                                    {
+                                        "severity": "warning",
+                                        "code": "incomplete",
+                                        "diagnostics": "synthetic-chart-value",
+                                    }
+                                ],
+                            }
+                        },
+                    ],
+                },
+            )
+        if request.url.path.endswith("/AllergyIntolerance"):
+            return httpx.Response(
+                200,
+                json={
+                    "resourceType": "Bundle",
+                    "type": "searchset",
+                    "total": 1,
+                    "entry": [
+                        {
+                            "resource": {
+                                "resourceType": "AllergyIntolerance",
+                                "id": "allergy-1",
+                                "code": {"text": "Recorded allergy"},
+                                "clinicalStatus": {"text": "active"},
+                                "verificationStatus": {"text": "confirmed"},
+                                "recordedDate": "2025-12-01",
+                            }
+                        }
+                    ],
+                },
+            )
+        return httpx.Response(
+            200,
+            json={
+                "resourceType": "Bundle",
+                "type": "searchset",
+                "total": 1,
+                "entry": [
+                    {
+                        "resource": {
+                            "resourceType": "Condition",
+                            "id": "condition-1",
+                            "code": {"text": "Recorded condition"},
+                            "clinicalStatus": {"text": "active"},
+                            "verificationStatus": {"text": "confirmed"},
+                            "recordedDate": "2025-11-01",
+                        }
+                    }
+                ],
+            },
+        )
+
+    async def run_test() -> None:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            epic = EpicSmartClient(
+                _epic_config(
+                    client_id="sandbox-client",
+                    redirect_uri="http://localhost:8765/callback",
+                    issuer="https://epic.example.test/api/FHIR/R4",
+                ),
+                http_client=client,
+            )
+            review = await epic.review_medications(
+                "synthetic-token",
+                patient_id="sample-001",
+            )
+
+        assert review.patient_id == "sample-001"
+        assert [item.resource_id for item in review.active_medications] == [
+            "med-order-1",
+            "med-order-2",
+            "med-order-3",
+            "med-order-4",
+            "med-order-5",
+        ]
+        assert review.active_medications[0].dosage_text == "As recorded"
+        assert review.allergies[0].resource_id == "allergy-1"
+        assert review.conditions[0].resource_id == "condition-1"
+        assert len(review.possible_duplicate_medications) == 1
+        assert review.possible_duplicate_medications[0].resource_ids == [
+            "med-order-1",
+            "med-order-2",
+        ]
+        assert "clinician" in review.possible_duplicate_medications[0].review_note
+        assert review.outcome_notes == ["MedicationRequest outcome warning/incomplete"]
+        assert {request.url.path.rsplit("/", 1)[-1] for request in requests} == {
+            "MedicationRequest",
+            "AllergyIntolerance",
+            "Condition",
+        }
+        for request in requests:
+            assert request.url.params["patient"] == "sample-001"
+            assert request.url.params["_count"] == "100"
+            assert request.headers["Authorization"] == "Bearer synthetic-token"
+        medication_request = next(
+            request
+            for request in requests
+            if request.url.path.endswith("/MedicationRequest")
+        )
+        assert medication_request.url.params["status"] == "active"
+
+    asyncio.run(run_test())
+
+
+def test_medication_review_rejects_truncated_fhir_search_results() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "resourceType": "Bundle",
+                "type": "searchset",
+                "total": 2,
+                "entry": [
+                    {
+                        "resource": {
+                            "resourceType": "MedicationRequest",
+                            "id": "med-order-1",
+                            "status": "active",
+                        }
+                    }
+                ],
+            },
+        )
+
+    async def run_test() -> None:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            epic = EpicSmartClient(
+                _epic_config(
+                    client_id="sandbox-client",
+                    redirect_uri="http://localhost:8765/callback",
+                ),
+                http_client=client,
+            )
+            with pytest.raises(ValueError, match="results are incomplete"):
+                await epic.review_medications(
+                    "synthetic-token",
+                    patient_id="sample-001",
+                )
+
+    asyncio.run(run_test())
+
+
+def test_medication_review_reports_safe_fhir_validation_details() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/MedicationRequest"):
+            return httpx.Response(
+                200,
+                json={
+                    "resourceType": "Bundle",
+                    "type": "searchset",
+                    "total": 1,
+                    "entry": [
+                        {
+                            "resource": {
+                                "resourceType": "MedicationStatement",
+                                "issue": [{"diagnostics": "synthetic-chart-value"}],
+                            }
+                        }
+                    ],
+                },
+            )
+        return httpx.Response(
+            200,
+            json={
+                "resourceType": "Bundle",
+                "type": "searchset",
+                "total": 0,
+                "entry": [],
+            },
+        )
+
+    async def run_test() -> None:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            epic = EpicSmartClient(
+                _epic_config(
+                    client_id="sandbox-client",
+                    redirect_uri="http://localhost:8765/callback",
+                ),
+                http_client=client,
+            )
+            with pytest.raises(ValueError) as error:
+                await epic.review_medications(
+                    "synthetic-token",
+                    patient_id="sample-001",
+                )
+
+        assert "Epic MedicationRequest results" in str(error.value)
+        assert "status" in str(error.value)
+        assert "resourceType='MedicationStatement'" in str(error.value)
+        assert "keys=issue,resourceType" in str(error.value)
+        assert "synthetic-chart-value" not in str(error.value)
+
+    asyncio.run(run_test())
+
+
+def test_medication_review_cli_uses_patient_context_and_displays_chart_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from rich.console import Console
+
+    from folium_agents.epic import epic_cli
+    from folium_agents.epic.epic import MEDICATION_REVIEW_SCOPE
+    from folium_agents.epic.models import (
+        ClinicalRecordSummary,
+        EpicMedicationSafetyReview,
+        EpicToken,
+        MedicationEntrySummary,
+        PossibleDuplicateMedication,
+    )
+
+    observed: dict[str, object] = {}
+    config = _epic_config(
+        client_id="sandbox-client",
+        redirect_uri="http://localhost:8765/callback",
+    )
+    smart = SmartConfiguration(
+        authorization_endpoint="https://epic.example.test/oauth/authorize",
+        token_endpoint="https://epic.example.test/oauth/token",
+        code_challenge_methods_supported=["S256"],
+    )
+
+    class FakeEpicClient:
+        def __init__(self, settings: EpicConfig) -> None:
+            observed["scope"] = settings.scope
+
+        async def discover(self) -> SmartConfiguration:
+            return smart
+
+        @staticmethod
+        def create_state() -> str:
+            return "synthetic-state"
+
+        @staticmethod
+        def create_pkce_pair() -> tuple[str, str]:
+            return "synthetic-verifier", "synthetic-challenge"
+
+        def build_authorization_url(
+            self,
+            discovered: SmartConfiguration,
+            *,
+            state: str,
+            code_challenge: str,
+        ) -> str:
+            observed["authorization"] = (discovered, state, code_challenge)
+            return "https://epic.example.test/authorize"
+
+        async def exchange_code(
+            self,
+            discovered: SmartConfiguration,
+            **kwargs: str,
+        ) -> EpicToken:
+            observed["exchange"] = kwargs
+            return EpicToken(
+                access_token="synthetic-access-token",
+                patient="sample-001",
+            )
+
+        async def review_medications(
+            self,
+            access_token: str,
+            *,
+            patient_id: str,
+        ) -> EpicMedicationSafetyReview:
+            observed["review"] = (access_token, patient_id)
+            return EpicMedicationSafetyReview(
+                patient_id=patient_id,
+                active_medications=[
+                    MedicationEntrySummary(
+                        resource_id="med-order-1",
+                        display="Sample medication",
+                        status="active",
+                    )
+                ],
+                allergies=[
+                    ClinicalRecordSummary(
+                        resource_id="allergy-1",
+                        display="Recorded allergy",
+                        clinical_status="active",
+                        verification_status="confirmed",
+                    )
+                ],
+                conditions=[
+                    ClinicalRecordSummary(
+                        resource_id="condition-1",
+                        display="Recorded condition",
+                        clinical_status="active",
+                        verification_status="confirmed",
+                    )
+                ],
+                possible_duplicate_medications=[
+                    PossibleDuplicateMedication(
+                        display="Sample medication",
+                        code_system="https://example.test/codes",
+                        code="12345",
+                        resource_ids=["med-order-1", "med-order-2"],
+                    )
+                ],
+                outcome_notes=["MedicationRequest outcome warning/suppressed"],
+            )
+
+    class FakeTokenCache:
+        def load(self) -> None:
+            return None
+
+        def save(self, token: EpicToken) -> None:
+            observed["saved_token"] = token
+
+        def clear(self) -> None:
+            observed["cache_cleared"] = True
+
+    fake_cache = FakeTokenCache()
+    monkeypatch.setattr(epic_cli.EpicConfig, "from_environment", lambda: config)
+    monkeypatch.setattr(epic_cli, "EpicSmartClient", FakeEpicClient)
+    monkeypatch.setattr(
+        epic_cli,
+        "EpicTokenCache",
+        lambda settings, *, context_id: (
+            observed.update({"cache_context": context_id}) or fake_cache
+        ),
+    )
+    monkeypatch.setattr(
+        epic_cli,
+        "_read_epic_callback",
+        lambda authorization_url, redirect_uri: {
+            "code": "synthetic-code",
+            "state": "synthetic-state",
+        },
+    )
+    console = Console(record=True, width=100)
+
+    asyncio.run(epic_cli.review_patient_medications("sample-001", console))
+
+    output = console.export_text()
+    assert observed["scope"] == MEDICATION_REVIEW_SCOPE
+    assert observed["cache_context"] == "sample-001"
+    assert observed["review"] == ("synthetic-access-token", "sample-001")
+    assert observed["saved_token"].patient == "sample-001"
+    assert "Recorded allergy" in output
+    assert "Recorded condition" in output
+    assert "Possible duplicate medication entries" in output
+    assert "clinician" in output
+    assert "FHIR warnings may indicate omitted records" in output
+    assert "MedicationRequest outcome warning/suppressed" in output
+    assert "synthetic-access-token" not in output
+    assert "interaction recommendation" not in output
+
+
+def test_medication_review_cli_rejects_wrong_authorized_patient_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from rich.console import Console
+
+    from folium_agents.epic import epic_cli
+    from folium_agents.epic.models import EpicToken
+
+    config = _epic_config(
+        client_id="sandbox-client",
+        redirect_uri="http://localhost:8765/callback",
+        scope="openid fhirUser launch/patient",
+    )
+    smart = SmartConfiguration(
+        authorization_endpoint="https://epic.example.test/oauth/authorize",
+        token_endpoint="https://epic.example.test/oauth/token",
+        code_challenge_methods_supported=["S256"],
+    )
+
+    class FakeEpicClient:
+        @staticmethod
+        def create_state() -> str:
+            return "synthetic-state"
+
+        @staticmethod
+        def create_pkce_pair() -> tuple[str, str]:
+            return "synthetic-verifier", "synthetic-challenge"
+
+        @staticmethod
+        def build_authorization_url(
+            discovered: SmartConfiguration,
+            *,
+            state: str,
+            code_challenge: str,
+        ) -> str:
+            return "https://epic.example.test/authorize"
+
+        async def exchange_code(
+            self,
+            discovered: SmartConfiguration,
+            **kwargs: str,
+        ) -> EpicToken:
+            return EpicToken(
+                access_token="synthetic-access-token",
+                patient="different-patient",
+            )
+
+    class FakeTokenCache:
+        def __init__(self) -> None:
+            self.cleared = False
+
+        def load(self) -> None:
+            return None
+
+        def save(self, token: EpicToken) -> None:
+            pytest.fail("A mismatched patient token must not be cached.")
+
+        def clear(self) -> None:
+            self.cleared = True
+
+    cache = FakeTokenCache()
+    monkeypatch.setattr(
+        epic_cli,
+        "_read_epic_callback",
+        lambda authorization_url, redirect_uri: {
+            "code": "synthetic-code",
+            "state": "synthetic-state",
+        },
+    )
+
+    async def run_test() -> None:
+        with pytest.raises(ValueError, match="did not match the requested"):
+            await epic_cli._get_medication_review_token(
+                FakeEpicClient(),
+                smart,
+                config,
+                cache,
+                "sample-001",
+                Console(),
+            )
+
+    asyncio.run(run_test())
+    assert cache.cleared
+
+
 def test_patient_cli_orchestrates_auth_and_displays_only_patient_summary(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from rich.console import Console
 
     from folium_agents.epic import epic_cli
-    from folium_agents.epic.epic import (
+    from folium_agents.epic.models import (
         EpicPatient,
         EpicPatientName,
         EpicPatientSearchResult,
@@ -486,7 +1071,9 @@ def test_patient_cli_orchestrates_auth_and_displays_only_patient_summary(
             observed["authorization"] = (discovered, state, code_challenge)
             return "https://epic.example.test/authorize"
 
-        async def exchange_code(self, discovered: SmartConfiguration, **kwargs: str) -> EpicToken:
+        async def exchange_code(
+            self, discovered: SmartConfiguration, **kwargs: str
+        ) -> EpicToken:
             observed["exchange"] = kwargs
             return EpicToken(access_token="synthetic-access-token")
 
@@ -553,7 +1140,7 @@ def test_patient_cli_reuses_unexpired_cached_access_token(
     from rich.console import Console
 
     from folium_agents.epic import epic_cli
-    from folium_agents.epic.epic import (
+    from folium_agents.epic.models import (
         CachedEpicToken,
         EpicPatient,
         EpicPatientName,
