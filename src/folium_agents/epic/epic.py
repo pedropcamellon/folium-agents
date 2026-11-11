@@ -1,5 +1,6 @@
 """SMART on FHIR client primitives for the Epic sandbox."""
 
+import asyncio
 import base64
 import hashlib
 import hmac
@@ -13,11 +14,15 @@ import httpx
 import jwt
 import keyring
 from cryptography.hazmat.primitives.serialization import load_pem_private_key
-from pydantic import BaseModel, ConfigDict, Field, SecretStr
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 DEFAULT_EPIC_FHIR_ISSUER = "https://fhir.epic.com/interconnect-fhir-oauth/api/FHIR/R4"
 DEFAULT_EPIC_SCOPE = "openid fhirUser user/Patient.rs"
+MEDICATION_REVIEW_SCOPE = (
+    "openid fhirUser launch/patient patient/MedicationRequest.rs "
+    "patient/AllergyIntolerance.rs patient/Condition.rs"
+)
 TOKEN_KEYRING_SERVICE = "folium-agents-epic"
 TOKEN_EXPIRY_SKEW_SECONDS = 30
 
@@ -117,10 +122,16 @@ class CachedEpicToken(BaseModel):
 
 
 class EpicTokenCache:
-    def __init__(self, config: EpicConfig) -> None:
-        self._account = hashlib.sha256(
-            f"{config.client_id}|{config.redirect_uri}|{config.issuer}".encode()
-        ).hexdigest()
+    def __init__(
+        self,
+        config: EpicConfig,
+        *,
+        context_id: str | None = None,
+    ) -> None:
+        identity = f"{config.client_id}|{config.redirect_uri}|{config.issuer}"
+        if context_id is not None:
+            identity = f"{identity}|{config.scope}|{context_id}"
+        self._account = hashlib.sha256(identity.encode()).hexdigest()
 
     def load(self) -> CachedEpicToken | None:
         value = keyring.get_password(TOKEN_KEYRING_SERVICE, self._account)
@@ -203,6 +214,207 @@ class EpicPatientBundle(BaseModel):
     resource_type: Literal["Bundle"] = Field(alias="resourceType")
     total: int | None = None
     entry: list[PatientBundleEntry] = Field(default_factory=list)
+
+
+class FhirCoding(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    system: str | None = None
+    code: str | None = None
+    display: str | None = None
+
+
+class FhirCodeableConcept(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    coding: list[FhirCoding] | None = Field(default_factory=list)
+    text: str | None = None
+
+    @property
+    def display(self) -> str:
+        if self.text and self.text.strip():
+            return self.text.strip()
+        for coding in self.coding or []:
+            if coding.display and coding.display.strip():
+                return coding.display.strip()
+            if coding.code and coding.code.strip():
+                return coding.code.strip()
+        return "Not specified in chart"
+
+
+class FhirReference(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    reference: str | None = None
+    display: str | None = None
+
+    @property
+    def resolved_display(self) -> str:
+        return self.display or self.reference or "Medication reference unavailable"
+
+
+class FhirDosageInstruction(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    text: str | None = None
+
+
+class FhirMedicationRequest(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    resource_type: Literal["MedicationRequest"] = Field(alias="resourceType")
+    id: str
+    status: str
+    medication_codeable_concept: FhirCodeableConcept | None = Field(
+        default=None,
+        alias="medicationCodeableConcept",
+    )
+    medication_reference: FhirReference | None = Field(
+        default=None,
+        alias="medicationReference",
+    )
+    authored_on: str | None = Field(default=None, alias="authoredOn")
+    dosage_instruction: list["FhirDosageInstruction"] | None = Field(
+        default_factory=list,
+        alias="dosageInstruction",
+    )
+
+    @property
+    def medication_display(self) -> str:
+        if self.medication_codeable_concept:
+            return self.medication_codeable_concept.display
+        if self.medication_reference:
+            return self.medication_reference.resolved_display
+        return "Medication unavailable in chart"
+
+    @property
+    def medication_code(self) -> tuple[str, str] | None:
+        if self.medication_codeable_concept is None:
+            return None
+        for coding in self.medication_codeable_concept.coding or []:
+            if coding.system and coding.code:
+                return coding.system, coding.code
+        return None
+
+    @property
+    def dosage_text(self) -> str | None:
+        for dosage in self.dosage_instruction or []:
+            if dosage.text and dosage.text.strip():
+                return dosage.text.strip()
+        return None
+
+
+class FhirClinicalRecord(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    resource_type: Literal["AllergyIntolerance", "Condition"] = Field(
+        alias="resourceType"
+    )
+    id: str
+    code: FhirCodeableConcept | None = None
+    clinical_status: FhirCodeableConcept | None = Field(
+        default=None,
+        alias="clinicalStatus",
+    )
+    verification_status: FhirCodeableConcept | None = Field(
+        default=None,
+        alias="verificationStatus",
+    )
+    recorded_date: str | None = Field(default=None, alias="recordedDate")
+    onset_date_time: str | None = Field(default=None, alias="onsetDateTime")
+
+    @property
+    def display(self) -> str:
+        if self.code:
+            return self.code.display
+        return "Not specified in chart"
+
+    @property
+    def clinical_status_display(self) -> str:
+        if self.clinical_status:
+            return self.clinical_status.display
+        return "Not specified"
+
+    @property
+    def verification_status_display(self) -> str:
+        if self.verification_status:
+            return self.verification_status.display
+        return "Not specified"
+
+
+class FhirSearchEntry(BaseModel):
+    resource: dict[str, Any]
+
+
+class FhirSearchLink(BaseModel):
+    relation: str
+    url: str
+
+
+class FhirSearchBundle(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    resource_type: Literal["Bundle"] = Field(alias="resourceType")
+    bundle_type: str | None = Field(default=None, alias="type")
+    total: int | None = None
+    link: list[FhirSearchLink] = Field(default_factory=list)
+    entry: list[FhirSearchEntry] = Field(default_factory=list)
+
+
+class FhirOperationIssue(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    severity: Literal["fatal", "error", "warning", "information", "success"]
+    code: str
+
+
+class FhirOperationOutcome(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    resource_type: Literal["OperationOutcome"] = Field(alias="resourceType")
+    issue: list[FhirOperationIssue]
+
+
+class FhirResourceSearchResult(BaseModel):
+    resources: list[dict[str, Any]]
+    outcome_notes: list[str]
+
+
+class MedicationEntrySummary(BaseModel):
+    resource_id: str
+    display: str
+    status: str
+    authored_on: str | None = None
+    dosage_text: str | None = None
+    code_system: str | None = None
+    code: str | None = None
+
+
+class ClinicalRecordSummary(BaseModel):
+    resource_id: str
+    display: str
+    clinical_status: str
+    verification_status: str
+    date: str | None = None
+
+
+class PossibleDuplicateMedication(BaseModel):
+    display: str
+    code_system: str
+    code: str
+    resource_ids: list[str]
+    review_note: str = (
+        "Possible duplicate active medication entries; verify with a clinician."
+    )
+
+
+class EpicMedicationSafetyReview(BaseModel):
+    patient_id: str
+    active_medications: list[MedicationEntrySummary]
+    allergies: list[ClinicalRecordSummary]
+    conditions: list[ClinicalRecordSummary]
+    possible_duplicate_medications: list[PossibleDuplicateMedication]
+    outcome_notes: list[str] = Field(default_factory=list)
 
 
 class EpicSmartClient:
@@ -422,10 +634,216 @@ class EpicSmartClient:
                 "Authorization": f"Bearer {access_token}",
             },
         )
+        self._raise_for_status_with_operation_outcome(response)
+        bundle = EpicPatientBundle.model_validate(response.json())
+        return EpicPatientSearchResult(
+            total=bundle.total,
+            patients=[entry.resource for entry in bundle.entry],
+        )
+
+    async def review_medications(
+        self,
+        access_token: str,
+        *,
+        patient_id: str,
+        issuer: str | None = None,
+    ) -> EpicMedicationSafetyReview:
+        patient_id = patient_id.strip()
+        if not access_token or not patient_id:
+            raise ValueError("An access token and Patient FHIR ID are required.")
+
+        medication_search, allergy_search, condition_search = await asyncio.gather(
+            self._search_patient_resource(
+                access_token,
+                "MedicationRequest",
+                patient_id,
+                issuer=issuer,
+                extra_params={"status": "active"},
+            ),
+            self._search_patient_resource(
+                access_token,
+                "AllergyIntolerance",
+                patient_id,
+                issuer=issuer,
+            ),
+            self._search_patient_resource(
+                access_token,
+                "Condition",
+                patient_id,
+                issuer=issuer,
+            ),
+        )
+
+        try:
+            medication_requests = [
+                FhirMedicationRequest.model_validate(resource)
+                for resource in medication_search.resources
+            ]
+        except ValidationError as error:
+            details = self._validation_error_summary(error)
+            shapes = self._resource_shape_summary(medication_search.resources)
+            raise ValueError(
+                "Epic MedicationRequest results did not match the expected FHIR "
+                f"shape: {details}; received resource shapes: {shapes}"
+            ) from None
+        try:
+            allergies = [
+                FhirClinicalRecord.model_validate(resource)
+                for resource in allergy_search.resources
+            ]
+            conditions = [
+                FhirClinicalRecord.model_validate(resource)
+                for resource in condition_search.resources
+            ]
+        except ValidationError as error:
+            details = self._validation_error_summary(error)
+            raise ValueError(
+                "Epic allergy or condition results did not match the expected FHIR "
+                f"shape: {details}"
+            ) from None
+
+        active_requests = [
+            request for request in medication_requests if request.status == "active"
+        ]
+        medication_summaries: list[MedicationEntrySummary] = []
+        requests_by_code: dict[tuple[str, str], list[FhirMedicationRequest]] = {}
+        for request in active_requests:
+            medication_summaries.append(
+                MedicationEntrySummary(
+                    resource_id=request.id,
+                    display=request.medication_display,
+                    status=request.status,
+                    authored_on=request.authored_on,
+                    dosage_text=request.dosage_text,
+                    code_system=request.medication_code[0]
+                    if request.medication_code
+                    else None,
+                    code=request.medication_code[1]
+                    if request.medication_code
+                    else None,
+                )
+            )
+            if request.medication_code:
+                requests_by_code.setdefault(request.medication_code, []).append(request)
+
+        duplicate_medications = [
+            PossibleDuplicateMedication(
+                display=requests[0].medication_display,
+                code_system=code_system,
+                code=code,
+                resource_ids=[request.id for request in requests],
+            )
+            for (code_system, code), requests in requests_by_code.items()
+            if len(requests) > 1
+        ]
+        return EpicMedicationSafetyReview(
+            patient_id=patient_id,
+            active_medications=medication_summaries,
+            allergies=[self._clinical_record_summary(record) for record in allergies],
+            conditions=[self._clinical_record_summary(record) for record in conditions],
+            possible_duplicate_medications=duplicate_medications,
+            outcome_notes=[
+                *medication_search.outcome_notes,
+                *allergy_search.outcome_notes,
+                *condition_search.outcome_notes,
+            ],
+        )
+
+    async def _search_patient_resource(
+        self,
+        access_token: str,
+        resource_type: Literal[
+            "MedicationRequest",
+            "AllergyIntolerance",
+            "Condition",
+        ],
+        patient_id: str,
+        *,
+        issuer: str | None = None,
+        extra_params: dict[str, str] | None = None,
+    ) -> FhirResourceSearchResult:
+        base_url = (issuer or self._config.issuer).rstrip("/")
+        params = {"patient": patient_id, "_count": "100"}
+        if extra_params:
+            params.update(extra_params)
+        response = await self._request(
+            "GET",
+            f"{base_url}/{resource_type}",
+            params=params,
+            headers={
+                "Accept": "application/fhir+json",
+                "Authorization": f"Bearer {access_token}",
+            },
+        )
+        self._raise_for_status_with_operation_outcome(response)
+        try:
+            bundle = FhirSearchBundle.model_validate(response.json())
+        except ValidationError:
+            raise ValueError(
+                f"Epic {resource_type} search did not return a valid FHIR Bundle."
+            ) from None
+        if bundle.bundle_type != "searchset":
+            raise ValueError(
+                f"Epic {resource_type} search did not return a searchset Bundle."
+            )
+        resources: list[dict[str, Any]] = []
+        outcome_notes: list[str] = []
+        for entry in bundle.entry:
+            resource = entry.resource
+            if resource.get("resourceType") != "OperationOutcome":
+                resources.append(resource)
+                continue
+            try:
+                outcome = FhirOperationOutcome.model_validate(resource)
+            except ValidationError as error:
+                details = self._validation_error_summary(error)
+                raise ValueError(
+                    f"Epic {resource_type} search returned an invalid "
+                    f"OperationOutcome: {details}"
+                ) from None
+            for issue in outcome.issue:
+                note = f"{resource_type} outcome {issue.severity}/{issue.code}"
+                if issue.severity in {"fatal", "error"}:
+                    raise ValueError(
+                        f"Epic {resource_type} search returned {note}; "
+                        "no medication review was produced."
+                    )
+                outcome_notes.append(note)
+
+        if (
+            any(link.relation == "next" for link in bundle.link)
+            or bundle.total is not None
+            and bundle.total > len(resources)
+        ):
+            raise ValueError(
+                f"Epic {resource_type} search results are incomplete; "
+                "no partial medication review was produced."
+            )
+        return FhirResourceSearchResult(
+            resources=resources,
+            outcome_notes=outcome_notes,
+        )
+
+    @staticmethod
+    def _clinical_record_summary(
+        record: FhirClinicalRecord,
+    ) -> ClinicalRecordSummary:
+        return ClinicalRecordSummary(
+            resource_id=record.id,
+            display=record.display,
+            clinical_status=record.clinical_status_display,
+            verification_status=record.verification_status_display,
+            date=record.recorded_date or record.onset_date_time,
+        )
+
+    @staticmethod
+    def _raise_for_status_with_operation_outcome(
+        response: httpx.Response,
+    ) -> None:
         try:
             response.raise_for_status()
         except httpx.HTTPStatusError as error:
-            details = self._operation_outcome_details(response)
+            details = EpicSmartClient._operation_outcome_details(response)
             if details is None:
                 raise
             raise httpx.HTTPStatusError(
@@ -433,11 +851,32 @@ class EpicSmartClient:
                 request=error.request,
                 response=response,
             ) from error
-        bundle = EpicPatientBundle.model_validate(response.json())
-        return EpicPatientSearchResult(
-            total=bundle.total,
-            patients=[entry.resource for entry in bundle.entry],
+
+    @staticmethod
+    def _validation_error_summary(error: ValidationError) -> str:
+        return "; ".join(
+            f"{'.'.join(str(part) for part in issue['loc'])}: {issue['msg']}"
+            for issue in error.errors(
+                include_input=False,
+                include_context=False,
+                include_url=False,
+            )
         )
+
+    @staticmethod
+    def _resource_shape_summary(resources: list[dict[str, Any]]) -> str:
+        summaries = []
+        for index, resource in enumerate(resources[:3], start=1):
+            resource_type = resource.get("resourceType")
+            type_name = resource_type if isinstance(resource_type, str) else "missing"
+            keys = sorted(key for key in resource if isinstance(key, str))
+            summaries.append(
+                f"entry {index}: resourceType={type_name!r}; keys={','.join(keys)}"
+            )
+        remaining = len(resources) - len(summaries)
+        if remaining > 0:
+            summaries.append(f"{remaining} additional entries")
+        return "; ".join(summaries)
 
     @staticmethod
     def _operation_outcome_details(response: httpx.Response) -> str | None:
@@ -445,7 +884,10 @@ class EpicSmartClient:
             outcome = response.json()
         except ValueError:
             return None
-        if not isinstance(outcome, dict) or outcome.get("resourceType") != "OperationOutcome":
+        if (
+            not isinstance(outcome, dict)
+            or outcome.get("resourceType") != "OperationOutcome"
+        ):
             return None
 
         issues = outcome.get("issue")

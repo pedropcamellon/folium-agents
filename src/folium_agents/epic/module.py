@@ -10,6 +10,7 @@ from folium_agents.epic.epic_cli import (
     discover_epic,
     list_epic_patients,
     logout_epic,
+    review_patient_medications,
 )
 
 
@@ -29,6 +30,15 @@ class EpicModule(HarnessModule):
             required=True,
             help="FHIR ID of a sandbox test patient",
         )
+        review_parser = actions.add_parser(
+            "medication-review",
+            help="review charted medications, allergies, and conditions",
+        )
+        review_parser.add_argument(
+            "--patient-id",
+            required=True,
+            help="FHIR ID of the patient selected during SMART authorization",
+        )
 
     def run(self, args: argparse.Namespace) -> None:
         console = Console()
@@ -38,6 +48,8 @@ class EpicModule(HarnessModule):
             logout_epic(console)
         elif args.action == "patients":
             asyncio.run(list_epic_patients(args.patient_id, console))
+        elif args.action == "medication-review":
+            asyncio.run(review_patient_medications(args.patient_id, console))
         else:
             raise ValueError(f"Unsupported Epic command: {args.action}")
 
