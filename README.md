@@ -21,7 +21,10 @@ import concrete EHR implementations.
 - `src/folium_agents/cli.py` — shared command-line routing
 - `src/folium_agents/core/` — module contract and vendor-neutral runtime
 - `src/folium_agents/epic/` — Epic SMART/FHIR client, secure token cache, and CLI
+- `src/folium_agents/openemr.py` — read-only OpenEMR FHIR client
+- `src/folium_agents/openemr_module.py` — OpenEMR module commands
 - `docs/epic-sandbox.md` — Epic sandbox setup and current proof
+- `docs/openemr-demo.md` — OpenEMR demo setup and current proof
 
 ## Development
 

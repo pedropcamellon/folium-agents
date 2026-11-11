@@ -24,6 +24,7 @@ folium-agents = "folium_agents:main"
 
 [project.entry-points."folium_agents.modules"]
 epic = "folium_agents.epic.module:create_module"
+openemr = "folium_agents.openemr_module:create_module"
 
 [build-system]
 requires = ["uv_build>=0.11.7,<0.12.0"]
