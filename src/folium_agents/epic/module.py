@@ -2,6 +2,7 @@
 
 import argparse
 import asyncio
+from collections.abc import Callable
 
 from rich.console import Console
 
@@ -12,6 +13,8 @@ from folium_agents.epic.epic_cli import (
     logout_epic,
     review_patient_medications,
 )
+
+CommandHandler = Callable[[argparse.Namespace, Console], None]
 
 
 class EpicModule(HarnessModule):
@@ -41,17 +44,32 @@ class EpicModule(HarnessModule):
         )
 
     def run(self, args: argparse.Namespace) -> None:
-        console = Console()
-        if args.action == "discover":
-            asyncio.run(discover_epic(console))
-        elif args.action == "logout":
-            logout_epic(console)
-        elif args.action == "patients":
-            asyncio.run(list_epic_patients(args.patient_id, console))
-        elif args.action == "medication-review":
-            asyncio.run(review_patient_medications(args.patient_id, console))
-        else:
+        handlers: dict[str, CommandHandler] = {
+            "discover": self._run_discover,
+            "logout": self._run_logout,
+            "patients": self._run_patients,
+            "medication-review": self._run_medication_review,
+        }
+        handler = handlers.get(args.action)
+        if handler is None:
             raise ValueError(f"Unsupported Epic command: {args.action}")
+        handler(args, Console())
+
+    @staticmethod
+    def _run_discover(_args: argparse.Namespace, console: Console) -> None:
+        asyncio.run(discover_epic(console))
+
+    @staticmethod
+    def _run_logout(_args: argparse.Namespace, console: Console) -> None:
+        logout_epic(console)
+
+    @staticmethod
+    def _run_patients(args: argparse.Namespace, console: Console) -> None:
+        asyncio.run(list_epic_patients(args.patient_id, console))
+
+    @staticmethod
+    def _run_medication_review(args: argparse.Namespace, console: Console) -> None:
+        asyncio.run(review_patient_medications(args.patient_id, console))
 
 
 def create_module() -> EpicModule:
