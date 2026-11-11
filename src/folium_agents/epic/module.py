@@ -1,75 +1,57 @@
 """Epic module registration for the generic Folium Agents harness."""
 
 import argparse
-import asyncio
-from collections.abc import Callable
+from importlib.metadata import entry_points
 
 from rich.console import Console
 
 from folium_agents.core.module import HarnessModule
-from folium_agents.epic.epic_cli import (
-    discover_epic,
-    list_epic_patients,
-    logout_epic,
-    review_patient_medications,
-)
+from folium_agents.epic.commands.protocol import EpicCommand
 
-CommandHandler = Callable[[argparse.Namespace, Console], None]
+COMMAND_ENTRY_POINT_GROUP = "folium_agents.epic.commands"
 
 
 class EpicModule(HarnessModule):
     name = "epic"
 
+    def __init__(self) -> None:
+        self._commands: dict[str, EpicCommand] = {}
+
     def register_commands(self, parser: argparse.ArgumentParser) -> None:
         actions = parser.add_subparsers(dest="action", required=True)
-        actions.add_parser("discover", help="inspect Epic SMART/FHIR capabilities")
-        actions.add_parser("logout", help="remove the saved Epic token")
-        patient_parser = actions.add_parser(
-            "patients",
-            help="search for a sandbox Patient by FHIR ID",
-        )
-        patient_parser.add_argument(
-            "--patient-id",
-            required=True,
-            help="FHIR ID of a sandbox test patient",
-        )
-        review_parser = actions.add_parser(
-            "medication-review",
-            help="review charted medications, allergies, and conditions",
-        )
-        review_parser.add_argument(
-            "--patient-id",
-            required=True,
-            help="FHIR ID of the patient selected during SMART authorization",
-        )
+        self._commands = self._discover_commands()
+        for command in self._commands.values():
+            command_parser = actions.add_parser(command.name, help=command.help)
+            command.configure_parser(command_parser)
 
     def run(self, args: argparse.Namespace) -> None:
-        handlers: dict[str, CommandHandler] = {
-            "discover": self._run_discover,
-            "logout": self._run_logout,
-            "patients": self._run_patients,
-            "medication-review": self._run_medication_review,
-        }
-        handler = handlers.get(args.action)
-        if handler is None:
+        command = self._commands.get(args.action)
+        if command is None:
             raise ValueError(f"Unsupported Epic command: {args.action}")
-        handler(args, Console())
+
+        command.run(args, Console())
 
     @staticmethod
-    def _run_discover(_args: argparse.Namespace, console: Console) -> None:
-        asyncio.run(discover_epic(console))
-
-    @staticmethod
-    def _run_logout(_args: argparse.Namespace, console: Console) -> None:
-        logout_epic(console)
-
-    @staticmethod
-    def _run_patients(args: argparse.Namespace, console: Console) -> None:
-        asyncio.run(list_epic_patients(args.patient_id, console))
-
-    @staticmethod
-    def _run_medication_review(args: argparse.Namespace, console: Console) -> None:
-        asyncio.run(review_patient_medications(args.patient_id, console))
+    def _discover_commands() -> dict[str, EpicCommand]:
+        commands: dict[str, EpicCommand] = {}
+        entry_points_for_commands = sorted(
+            entry_points(group=COMMAND_ENTRY_POINT_GROUP),
+            key=lambda point: point.name,
+        )
+        for entry_point in entry_points_for_commands:
+            if entry_point.name in commands:
+                raise ValueError(
+                    f"Duplicate Epic command entry point: {entry_point.name}"
+                )
+            command_factory = entry_point.load()
+            command = command_factory()
+            if command.name != entry_point.name:
+                raise ValueError(
+                    f"Epic command entry point {entry_point.name!r} "
+                    f"created command named {command.name!r}."
+                )
+            commands[command.name] = command
+        return commands
 
 
 def create_module() -> EpicModule:

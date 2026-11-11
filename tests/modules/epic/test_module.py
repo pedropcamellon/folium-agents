@@ -1,54 +1,115 @@
 import argparse
+from collections.abc import Callable
 
 import pytest
+from rich.console import Console
 
 from folium_agents.epic import module as epic_module
 from folium_agents.epic.module import EpicModule
 
 
-def test_module_dispatches_registered_commands(monkeypatch: pytest.MonkeyPatch) -> None:
-    calls: list[tuple[str, str | None]] = []
+class FakeEntryPoint:
+    def __init__(self, name: str, factory: Callable[[], object]) -> None:
+        self.name = name
+        self._factory = factory
 
-    async def discover(_console: object) -> None:
-        calls.append(("discover", None))
+    def load(self) -> Callable[[], object]:
+        return self._factory
 
-    def logout(_console: object) -> None:
-        calls.append(("logout", None))
 
-    async def patients(patient_id: str, _console: object) -> None:
-        calls.append(("patients", patient_id))
+class FakeCommand:
+    def __init__(self, name: str, calls: list[tuple[str, str]]) -> None:
+        self.name = name
+        self.help = f"run {name}"
+        self._calls = calls
 
-    async def medication_review(patient_id: str, _console: object) -> None:
-        calls.append(("medication-review", patient_id))
+    def configure_parser(self, parser: argparse.ArgumentParser) -> None:
+        parser.add_argument("--value", required=True)
 
-    monkeypatch.setattr(epic_module, "discover_epic", discover)
-    monkeypatch.setattr(epic_module, "logout_epic", logout)
-    monkeypatch.setattr(epic_module, "list_epic_patients", patients)
+    def run(self, args: argparse.Namespace, _console: Console) -> None:
+        self._calls.append((self.name, args.value))
+
+
+def test_module_discovers_configures_and_runs_entry_point_commands(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, str]] = []
+    commands = {name: FakeCommand(name, calls) for name in ("alpha", "beta")}
+    points = [
+        FakeEntryPoint(name, lambda command=command: command)
+        for name, command in reversed(tuple(commands.items()))
+    ]
     monkeypatch.setattr(
         epic_module,
-        "review_patient_medications",
-        medication_review,
+        "entry_points",
+        lambda *, group: points,
     )
 
     module = EpicModule()
     parser = argparse.ArgumentParser()
     module.register_commands(parser)
-    for argv in (
-        ["discover"],
-        ["logout"],
-        ["patients", "--patient-id", "patient-1"],
-        ["medication-review", "--patient-id", "patient-2"],
-    ):
-        module.run(parser.parse_args(argv))
+    module.run(parser.parse_args(["alpha", "--value", "first"]))
+    module.run(parser.parse_args(["beta", "--value", "second"]))
 
-    assert calls == [
-        ("discover", None),
-        ("logout", None),
-        ("patients", "patient-1"),
-        ("medication-review", "patient-2"),
+    assert calls == [("alpha", "first"), ("beta", "second")]
+
+
+def test_module_rejects_duplicate_entry_point_names(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def factory() -> FakeCommand:
+        return FakeCommand("duplicate", [])
+
+    points = [
+        FakeEntryPoint("duplicate", factory),
+        FakeEntryPoint("duplicate", factory),
     ]
+    monkeypatch.setattr(
+        epic_module,
+        "entry_points",
+        lambda *, group: points,
+    )
+
+    with pytest.raises(ValueError, match="Duplicate Epic command entry point"):
+        EpicModule().register_commands(argparse.ArgumentParser())
 
 
-def test_module_rejects_unsupported_commands() -> None:
+def test_module_rejects_command_name_mismatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    point = FakeEntryPoint("registered-name", lambda: FakeCommand("different-name", []))
+    monkeypatch.setattr(
+        epic_module,
+        "entry_points",
+        lambda *, group: [point],
+    )
+
+    with pytest.raises(ValueError, match="created command named"):
+        EpicModule().register_commands(argparse.ArgumentParser())
+
+
+def test_builtin_commands_are_registered_from_package_entry_points() -> None:
+    module = EpicModule()
+    parser = argparse.ArgumentParser()
+    module.register_commands(parser)
+
+    assert parser.parse_args(["discover"]).action == "discover"
+    assert parser.parse_args(["logout"]).action == "logout"
+    assert parser.parse_args(["patients", "--patient-id", "patient-1"]).patient_id == (
+        "patient-1"
+    )
+    assert (
+        parser.parse_args(["medication-review", "--patient-id", "patient-2"]).patient_id
+        == "patient-2"
+    )
+
+
+def test_module_rejects_unsupported_commands(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(epic_module, "entry_points", lambda *, group: [])
+    module = EpicModule()
+    module.register_commands(argparse.ArgumentParser())
+
     with pytest.raises(ValueError, match="Unsupported Epic command"):
-        EpicModule().run(argparse.Namespace(action="unsupported"))
+        module.run(argparse.Namespace(action="unsupported"))

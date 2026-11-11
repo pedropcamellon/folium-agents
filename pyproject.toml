@@ -26,6 +26,12 @@ folium-agents = "folium_agents:main"
 epic = "folium_agents.epic.module:create_module"
 openemr = "folium_agents.openemr_module:create_module"
 
+[project.entry-points."folium_agents.epic.commands"]
+discover = "folium_agents.epic.commands.discover:create_command"
+logout = "folium_agents.epic.commands.logout:create_command"
+patients = "folium_agents.epic.commands.patients:create_command"
+medication-review = "folium_agents.epic.commands.medication_review:create_command"
+
 [build-system]
 requires = ["uv_build>=0.11.7,<0.12.0"]
 build-backend = "uv_build"
