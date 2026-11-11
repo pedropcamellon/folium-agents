@@ -8,11 +8,13 @@ import pytest
 from pydantic import ValidationError
 
 from folium_agents.epic.epic import (
-    CachedEpicToken,
     EpicConfig,
     EpicSmartClient,
-    EpicToken,
     EpicTokenCache,
+)
+from folium_agents.epic.models import (
+    CachedEpicToken,
+    EpicToken,
     SmartConfiguration,
 )
 
@@ -792,8 +794,8 @@ def test_medication_review_cli_uses_patient_context_and_displays_chart_evidence(
     from rich.console import Console
 
     from folium_agents.epic import epic_cli
-    from folium_agents.epic.epic import (
-        MEDICATION_REVIEW_SCOPE,
+    from folium_agents.epic.epic import MEDICATION_REVIEW_SCOPE
+    from folium_agents.epic.models import (
         ClinicalRecordSummary,
         EpicMedicationSafetyReview,
         EpicToken,
@@ -944,7 +946,7 @@ def test_medication_review_cli_rejects_wrong_authorized_patient_context(
     from rich.console import Console
 
     from folium_agents.epic import epic_cli
-    from folium_agents.epic.epic import EpicToken
+    from folium_agents.epic.models import EpicToken
 
     config = _epic_config(
         client_id="sandbox-client",
@@ -1029,7 +1031,7 @@ def test_patient_cli_orchestrates_auth_and_displays_only_patient_summary(
     from rich.console import Console
 
     from folium_agents.epic import epic_cli
-    from folium_agents.epic.epic import (
+    from folium_agents.epic.models import (
         EpicPatient,
         EpicPatientName,
         EpicPatientSearchResult,
@@ -1138,7 +1140,7 @@ def test_patient_cli_reuses_unexpired_cached_access_token(
     from rich.console import Console
 
     from folium_agents.epic import epic_cli
-    from folium_agents.epic.epic import (
+    from folium_agents.epic.models import (
         CachedEpicToken,
         EpicPatient,
         EpicPatientName,

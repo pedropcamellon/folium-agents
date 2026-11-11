@@ -13,10 +13,12 @@ from rich.table import Table
 from folium_agents.epic.epic import (
     MEDICATION_REVIEW_SCOPE,
     EpicConfig,
-    EpicMedicationSafetyReview,
     EpicSmartClient,
-    EpicToken,
     EpicTokenCache,
+)
+from folium_agents.epic.models import (
+    EpicMedicationSafetyReview,
+    EpicToken,
     SmartConfiguration,
 )
 
