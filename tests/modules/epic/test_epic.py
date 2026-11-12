@@ -461,6 +461,89 @@ def test_search_patients_requests_bounded_minimal_patient_data() -> None:
     asyncio.run(run_test())
 
 
+def test_get_patient_reads_only_the_selected_patient_demographics() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "resourceType": "Patient",
+                "id": "sample-001",
+                "name": [{"use": "official", "given": ["Alex"], "family": "Sample"}],
+                "birthDate": "1980-01-01",
+            },
+        )
+
+    async def run_test() -> None:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            epic = EpicSmartClient(
+                _epic_config(
+                    client_id="sandbox-client",
+                    redirect_uri="http://localhost:8765/callback",
+                    issuer="https://epic.example.test/api/FHIR/R4",
+                ),
+                http_client=client,
+            )
+            patient = await epic.get_patient("synthetic-token", "sample-001")
+
+        assert patient.id == "sample-001"
+        assert patient.primary_name is not None
+        assert patient.primary_name.given == ["Alex"]
+        assert patient.primary_name.family == "Sample"
+        assert patient.birth_date == "1980-01-01"
+        assert len(requests) == 1
+        assert requests[0].method == "GET"
+        assert str(requests[0].url) == (
+            "https://epic.example.test/api/FHIR/R4/Patient/sample-001"
+        )
+
+    asyncio.run(run_test())
+
+
+def test_get_patient_rejects_ids_that_could_change_the_resource_path() -> None:
+    async def run_test() -> None:
+        async with httpx.AsyncClient() as client:
+            epic = EpicSmartClient(
+                _epic_config(
+                    client_id="sandbox-client",
+                    redirect_uri="http://localhost:8765/callback",
+                ),
+                http_client=client,
+            )
+            with pytest.raises(ValueError, match="valid Patient FHIR ID"):
+                await epic.get_patient("synthetic-token", "../other-patient")
+
+    asyncio.run(run_test())
+
+
+def test_get_patient_rejects_a_different_returned_patient() -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "resourceType": "Patient",
+                "id": "another-patient",
+                "name": [{"given": ["Synthetic"], "family": "Patient"}],
+            },
+        )
+
+    async def run_test() -> None:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            epic = EpicSmartClient(
+                _epic_config(
+                    client_id="sandbox-client",
+                    redirect_uri="http://localhost:8765/callback",
+                ),
+                http_client=client,
+            )
+            with pytest.raises(ValueError, match="outside the selected context"):
+                await epic.get_patient("synthetic-token", "sample-001")
+
+    asyncio.run(run_test())
+
+
 def test_search_patients_includes_epic_operation_outcome_details() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
@@ -731,6 +814,45 @@ def test_medication_review_rejects_truncated_fhir_search_results() -> None:
                     "synthetic-token",
                     patient_id="sample-001",
                 )
+
+    asyncio.run(run_test())
+
+
+def test_fhir_search_preserves_empty_result_and_selected_patient_scope() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "resourceType": "Bundle",
+                "type": "searchset",
+                "total": 0,
+                "entry": [],
+            },
+        )
+
+    async def run_test() -> None:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            epic = EpicSmartClient(
+                _epic_config(
+                    client_id="sandbox-client",
+                    redirect_uri="http://localhost:8765/callback",
+                    issuer="https://epic.example.test/api/FHIR/R4",
+                ),
+                http_client=client,
+            )
+            result = await epic._search_patient_resource(
+                "synthetic-token",
+                "Condition",
+                "sample-001",
+            )
+
+        assert result.resources == []
+        assert result.outcome_notes == []
+        assert len(requests) == 1
+        assert requests[0].url.params["patient"] == "sample-001"
 
     asyncio.run(run_test())
 

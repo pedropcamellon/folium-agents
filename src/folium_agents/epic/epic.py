@@ -4,6 +4,7 @@ import asyncio
 import base64
 import hashlib
 import hmac
+import re
 import secrets
 import time
 from pathlib import Path
@@ -22,6 +23,7 @@ from folium_agents.epic.models import (
     CarePlanSummary,
     ClinicalRecordSummary,
     EpicMedicationSafetyReview,
+    EpicPatient,
     EpicPatientBundle,
     EpicPatientSearchResult,
     EpicToken,
@@ -40,7 +42,7 @@ DEFAULT_EPIC_FHIR_ISSUER = "https://fhir.epic.com/interconnect-fhir-oauth/api/FH
 DEFAULT_EPIC_SCOPE = "openid fhirUser user/Patient.rs"
 MEDICATION_REVIEW_SCOPE = (
     "openid fhirUser launch/patient patient/MedicationRequest.rs "
-    "patient/AllergyIntolerance.rs patient/Condition.rs"
+    "patient/AllergyIntolerance.rs patient/Condition.rs patient/Patient.r"
 )
 TOKEN_KEYRING_SERVICE = "folium-agents-epic"
 
@@ -342,6 +344,40 @@ class EpicSmartClient:
             total=bundle.total,
             patients=[entry.resource for entry in bundle.entry],
         )
+
+    async def get_patient(
+        self,
+        access_token: str,
+        patient_id: str,
+        *,
+        issuer: str | None = None,
+    ) -> EpicPatient:
+        if not access_token:
+            raise ValueError("An access token is required.")
+        if (
+            not patient_id
+            or patient_id in {".", ".."}
+            or re.fullmatch(r"[A-Za-z0-9.-]{1,64}", patient_id) is None
+        ):
+            raise ValueError("A valid Patient FHIR ID is required.")
+
+        base_url = (issuer or self._config.issuer).rstrip("/")
+        response = await self._request(
+            "GET",
+            f"{base_url}/Patient/{patient_id}",
+            headers={
+                "Accept": "application/fhir+json",
+                "Authorization": f"Bearer {access_token}",
+            },
+        )
+        self._raise_for_status_with_operation_outcome(response)
+        try:
+            patient = EpicPatient.model_validate(response.json())
+        except ValidationError:
+            raise ValueError("Epic did not return a valid FHIR Patient.") from None
+        if patient.id != patient_id:
+            raise ValueError("Epic returned a Patient outside the selected context.")
+        return patient
 
     async def review_medications(
         self,

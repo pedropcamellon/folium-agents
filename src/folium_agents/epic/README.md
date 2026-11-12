@@ -1,10 +1,9 @@
-# Folium Agents — Epic sandbox connector
+# Epic sandbox connector
 
-This learning project tests an external, clinician-authorized connection to
-Epic's FHIR sandbox. The current proof searches for a synthetic sample patient by FHIR ID using
-read-only `Patient` access. Epic's sandbox does not allow an unfiltered Patient
-listing. The CLI displays only the ID and name and does not write records or
-print access tokens.
+The Epic module provides the first EHR connector for the provider-neutral
+Folium Agents chat. Its web login uses SMART authorization code + PKCE and
+keeps tokens server-side. The first chat proof is restricted to synthetic
+sandbox patients and read-only resources.
 
 ## Configure
 
@@ -23,12 +22,14 @@ The default `none` method sends the client ID and PKCE verifier without a
 client secret or private key. Use the authentication method configured for
 your Epic app registration. The app must have Patient read/search enabled.
 
-OAuth tokens are stored in the operating system credential store (macOS
+CLI OAuth tokens are stored in the operating system credential store (macOS
 Keychain on macOS), not in `.env` or a project file. The CLI reuses an
 unexpired access token. If Epic returns a refresh token, it is stored and used
 to refresh the access token; otherwise, the CLI asks you to authorize again
 after the access token expires. No `offline_access` scope is added
 automatically. Remove the saved token with `uv run folium-agents epic logout`.
+The web API uses a separate per-connection encrypted store in Compose, not the
+host keyring. See the chat guide for restart retention and local revocation.
 
 To opt into `private_key_jwt`, create a key pair and upload only its public key
 to the Epic app registration. Keep the private key local and outside the
@@ -71,7 +72,9 @@ sandbox rejects `_elements`; the CLI only displays the ID and name. Tokens are
 never displayed by the CLI.
 
 Use an ID listed in Epic's [sandbox test patient documentation](https://fhir.epic.com/Documentation?docId=testpatients).
-This command does not enumerate every sandbox patient.
+The patient command never enumerates patients. The web chat flow, Compose
+callback URI, actual resource access, and Azure model setup are documented in
+[docs/epic-chat.md](../../docs/epic-chat.md).
 
 The sandbox contains synthetic test data. This does not authorize access to
 production systems; each Epic customer controls and approves its own

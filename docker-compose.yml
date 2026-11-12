@@ -1,0 +1,101 @@
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    user: "0:0"
+    env_file:
+      - path: .env
+        required: false
+      - path: .env.azure-local
+        required: false
+    environment:
+      FOLIUM_AGENTS_API_HOST: 0.0.0.0
+      FOLIUM_AGENTS_API_PORT: "8000"
+      FOLIUM_AGENTS_FRONTEND_ORIGIN: ${FOLIUM_AGENTS_FRONTEND_ORIGIN:-http://localhost:3000}
+      FOLIUM_AGENTS_MODEL_BASE_URL: ${FOLIUM_AGENTS_MODEL_BASE_URL:-}
+      FOLIUM_AGENTS_MODEL_NAME: ${FOLIUM_AGENTS_MODEL_NAME:-}
+      FOLIUM_AGENTS_MODEL_REASONING_EFFORT: low
+      FOLIUM_AGENTS_LOG_MODEL_RESPONSES: "true"
+      FOLIUM_AGENTS_REQUIRE_MODEL_CITATIONS: "false"
+      FOLIUM_AGENTS_MODEL_API_KEY_HEADER: ${FOLIUM_AGENTS_MODEL_API_KEY_HEADER:-api-key}
+      EPIC_REDIRECT_URI: ${FOLIUM_AGENTS_EPIC_REDIRECT_URI:-http://localhost:8000/api/epic/callback}
+      FOLIUM_AGENTS_CONNECTION_DB: /app/connections/connections.sqlite3
+      FOLIUM_AGENTS_CONNECTION_KEY_FILE: /app/connection-keys/connection.key
+    command:
+      - sh
+      - -c
+      - uv sync --frozen && uv run uvicorn folium_agents.api.app:app --host 0.0.0.0 --port 8000 --reload --reload-dir /app/src --no-access-log
+    volumes:
+      - ./src:/app/src
+      - api-venv:/app/.venv
+      - api-connections:/app/connections
+      - api-connection-keys:/app/connection-keys
+    ports:
+      - "127.0.0.1:8000:8000"
+    develop:
+      watch:
+        - action: rebuild
+          path: ./pyproject.toml
+        - action: rebuild
+          path: ./uv.lock
+        - action: rebuild
+          path: ./Dockerfile
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz')"
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: frontend
+      dockerfile: Dockerfile
+      args:
+        NEXT_PUBLIC_FOLIUM_AGENTS_API_URL: ${NEXT_PUBLIC_FOLIUM_AGENTS_API_URL:-http://localhost:8000}
+    user: "0:0"
+    environment:
+      NODE_ENV: development
+      NEXT_PUBLIC_FOLIUM_AGENTS_API_URL: http://localhost:8000
+    command:
+      - sh
+      - -c
+      - CI=true pnpm install --frozen-lockfile && pnpm dev --hostname 0.0.0.0
+    volumes:
+      - ./frontend:/app
+      - frontend-node-modules:/app/node_modules
+      - frontend-next:/app/.next
+    ports:
+      - "127.0.0.1:3000:3000"
+    develop:
+      watch:
+        - action: rebuild
+          path: ./frontend/package.json
+        - action: rebuild
+          path: ./frontend/pnpm-lock.yaml
+        - action: rebuild
+          path: ./frontend/Dockerfile
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:3000').then((r) => { if (!r.ok) process.exit(1) }).catch(() => process.exit(1))"
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
+
+volumes:
+  api-venv:
+  api-connections:
+  api-connection-keys:
+  frontend-node-modules:
+  frontend-next:
