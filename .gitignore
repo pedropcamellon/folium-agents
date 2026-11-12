@@ -18,6 +18,7 @@ frontend/node_modules/
 frontend/.next/
 frontend/.pnpm-store/*
 frontend/*.tsbuildinfo
+frontend/.next/
 
 # Terraform
 terraform/.terraform/
