@@ -1,8 +1,9 @@
-# Epic sandbox connector
+# Epic sandbox connector and CLI
 
-The Epic adapter is the first external EHR connector proof. It uses SMART on
-FHIR authorization to list a bounded number of synthetic sandbox patients
-with read-only access. It does not write records or display bearer tokens.
+The Epic adapter is the first implementation of the provider-neutral EHR
+connector contract. It uses SMART on FHIR for read-only synthetic sandbox
+access. Patient lookup requires an explicit FHIR ID; it does not enumerate
+patients.
 
 ## Configure
 
@@ -19,7 +20,10 @@ EPIC_SCOPE=openid fhirUser user/Patient.rs
 
 The default `none` method sends the client ID and PKCE verifier without a
 client secret or private key. Use the authentication method configured for
-your Epic app registration. The app must have Patient read/search enabled.
+your Epic app registration. The `patients` command requires Patient read/search. The web chat uses a
+separate patient-scoped SMART grant for its registered read-only resources.
+Verify those scopes against the Epic app registration and actual sandbox grant
+before relying on any resource type. See [Epic chat setup](./epic-chat.md).
 
 Private-key JWT is optional. To use it, upload your public key to the Epic app
 registration, then set `EPIC_TOKEN_AUTH_METHOD=private_key_jwt` and
@@ -51,3 +55,8 @@ in the OS credential store and are never displayed by the CLI.
 The sandbox contains synthetic test data. This does not authorize access to
 production systems; each Epic customer controls and approves its own
 connection.
+
+The standalone MedicationRequest review command has been superseded by the
+open-flow web chat. Its currently implemented resource coverage is provisional
+until actual Epic sandbox interactions and app scopes are confirmed. Offline
+tests do not establish sandbox or customer interoperability.
