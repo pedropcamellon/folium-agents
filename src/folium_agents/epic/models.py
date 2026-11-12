@@ -95,10 +95,19 @@ class EpicPatient(BaseModel):
     resource_type: Literal["Patient"] = Field(alias="resourceType")
     id: str
     name: list[EpicPatientName] = Field(default_factory=list)
+    birth_date: str | None = Field(default=None, alias="birthDate")
+
+    @property
+    def primary_name(self) -> EpicPatientName | None:
+        return next(
+            (patient_name for patient_name in self.name if patient_name.given or patient_name.family),
+            None,
+        )
 
     @property
     def display_name(self) -> str:
-        for patient_name in self.name:
+        patient_name = self.primary_name
+        if patient_name is not None:
             parts = [*patient_name.given, patient_name.family]
             display_name = " ".join(part for part in parts if part)
             if display_name:

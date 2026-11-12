@@ -51,7 +51,7 @@ def _read_epic_callback(authorization_url: str, redirect_uri: str) -> dict[str, 
             callback_params.update(
                 {key: values[0] for key, values in parse_qs(request_url.query).items()}
             )
-            body = b"Epic authorization response received. Return to the terminal."
+            body = b"Epic authorization response received. Return to the chat."
             self.send_response(200)
             self.send_header("Content-Type", "text/plain; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))

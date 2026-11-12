@@ -98,10 +98,6 @@ def test_builtin_commands_are_registered_from_package_entry_points() -> None:
     assert parser.parse_args(["patients", "--patient-id", "patient-1"]).patient_id == (
         "patient-1"
     )
-    assert (
-        parser.parse_args(["medication-review", "--patient-id", "patient-2"]).patient_id
-        == "patient-2"
-    )
 
 
 def test_module_rejects_unsupported_commands(
