@@ -71,6 +71,43 @@ ID. The API response may include the full Patient resource because this
 sandbox rejects `_elements`; the CLI only displays the ID and name. Tokens are
 never displayed by the CLI.
 
+## Run the CLI in Docker
+
+The web app is the user-facing chat experience. Use this CLI image for
+developer diagnostics and explicit sandbox checks; it does not replace the
+web app.
+
+The CLI image keeps configuration out of image layers. Build and run its
+opt-in Compose profile from the repository root:
+
+```bash
+docker compose --profile cli build cli
+docker compose --profile cli run --rm cli epic discover
+```
+
+The CLI is a one-shot command, so use `run`, not `up`. `docker compose
+--profile cli up` also starts the API and frontend, then the CLI exits after
+printing its default help.
+
+For OAuth, set `EPIC_REDIRECT_URI=http://localhost:8765/callback` in the
+repository-root `.env` file. Compose publishes the callback only on the local
+host interface:
+
+```bash
+docker compose --profile cli run --rm --service-ports -it cli epic patients --patient-id <FHIR_ID>
+```
+
+The image binds the callback listener to all container interfaces so the
+published host port can reach it. The host port is restricted to loopback.
+`EPIC_TOKEN_CACHE_ENABLED` defaults to `false` in the image: CLI tokens remain
+in process memory only and a new authorization is needed for each container
+run. Do not mount a host keyring or enable persistent token caching in a
+container unless you provide and secure an appropriate credential store.
+
+Run `bash scripts/test-cli-docker.sh` to build the image and smoke-test CLI
+discovery, disabled keyring access, and the published OAuth callback using
+synthetic callback parameters. It does not perform a patient lookup.
+
 Use an ID listed in Epic's [sandbox test patient documentation](https://fhir.epic.com/Documentation?docId=testpatients).
 The patient command never enumerates patients. The web chat flow, Compose
 callback URI, actual resource access, and Azure model setup are documented in

@@ -71,6 +71,7 @@ class EpicConfig(BaseSettings):
     private_key_algorithm: Literal["RS384", "ES384"] = "RS384"
     scope: str = DEFAULT_EPIC_SCOPE
     issuer: str = DEFAULT_EPIC_FHIR_ISSUER
+    token_cache_enabled: bool = True
 
     @classmethod
     def from_environment(cls) -> "EpicConfig":
@@ -84,12 +85,15 @@ class EpicTokenCache:
         *,
         context_id: str | None = None,
     ) -> None:
+        self._enabled = config.token_cache_enabled
         identity = f"{config.client_id}|{config.redirect_uri}|{config.issuer}"
         if context_id is not None:
             identity = f"{identity}|{config.scope}|{context_id}"
         self._account = hashlib.sha256(identity.encode()).hexdigest()
 
     def load(self) -> CachedEpicToken | None:
+        if not self._enabled:
+            return None
         value = keyring.get_password(TOKEN_KEYRING_SERVICE, self._account)
         if value is None:
             return None
@@ -103,6 +107,8 @@ class EpicTokenCache:
             ) from None
 
     def save(self, token: EpicToken) -> None:
+        if not self._enabled:
+            return
         if token.expires_in is None or token.expires_in <= 0:
             self.clear()
             return
@@ -117,6 +123,8 @@ class EpicTokenCache:
         )
 
     def clear(self) -> None:
+        if not self._enabled:
+            return
         if keyring.get_password(TOKEN_KEYRING_SERVICE, self._account) is not None:
             keyring.delete_password(TOKEN_KEYRING_SERVICE, self._account)
 

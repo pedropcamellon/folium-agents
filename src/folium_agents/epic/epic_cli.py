@@ -1,6 +1,7 @@
 """Epic sandbox command workflows."""
 
 import asyncio
+import os
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from threading import Event, Thread
@@ -62,7 +63,8 @@ def _read_epic_callback(authorization_url: str, redirect_uri: str) -> dict[str, 
         def log_message(self, format: str, *args: object) -> None:
             return
 
-    server = ThreadingHTTPServer(("127.0.0.1", redirect.port), CallbackHandler)
+    bind_host = os.environ.get("FOLIUM_AGENTS_EPIC_CALLBACK_BIND_HOST", "127.0.0.1")
+    server = ThreadingHTTPServer((bind_host, redirect.port), CallbackHandler)
     server.timeout = 300
     thread = Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -122,7 +124,11 @@ async def discover_epic(console: Console) -> None:
 
 
 def logout_epic(console: Console) -> None:
-    token_cache = EpicTokenCache(EpicConfig.from_environment())
+    config = EpicConfig.from_environment()
+    if not config.token_cache_enabled:
+        console.print("Epic token caching is disabled; no saved token was removed.")
+        return
+    token_cache = EpicTokenCache(config)
     token_cache.clear()
     console.print("Removed the saved Epic token from the OS credential store.")
 
