@@ -260,6 +260,28 @@ def test_epic_token_cache_round_trips_only_through_keyring(
     assert records == {}
 
 
+def test_disabled_epic_token_cache_does_not_access_keyring(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from folium_agents.epic import epic
+
+    def unexpected_keyring_access(*args: object) -> None:
+        pytest.fail("A disabled token cache must not access the OS keyring.")
+
+    monkeypatch.setattr(epic.keyring, "get_password", unexpected_keyring_access)
+    monkeypatch.setattr(epic.keyring, "set_password", unexpected_keyring_access)
+    monkeypatch.setattr(epic.keyring, "delete_password", unexpected_keyring_access)
+    config = _epic_config(
+        client_id="sandbox-client",
+        redirect_uri="http://localhost:8765/callback",
+    ).model_copy(update={"token_cache_enabled": False})
+    cache = EpicTokenCache(config)
+
+    assert cache.load() is None
+    cache.save(EpicToken(access_token="synthetic-access-token", expires_in=600))
+    cache.clear()
+
+
 def test_epic_token_cache_isolates_medication_review_scope_and_patient(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

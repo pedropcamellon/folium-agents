@@ -2,7 +2,7 @@ services:
   api:
     build:
       context: .
-      dockerfile: Dockerfile
+      dockerfile: src/folium_agents/api/Dockerfile
     user: "0:0"
     env_file:
       - path: .env
@@ -40,7 +40,7 @@ services:
         - action: rebuild
           path: ./uv.lock
         - action: rebuild
-          path: ./Dockerfile
+          path: ./src/folium_agents/api/Dockerfile
     healthcheck:
       test:
         - CMD
@@ -52,6 +52,21 @@ services:
       retries: 5
       start_period: 20s
     restart: unless-stopped
+
+  cli:
+    profiles:
+      - cli
+    build:
+      context: .
+      dockerfile: src/folium_agents/epic/Dockerfile
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      EPIC_REDIRECT_URI: ${EPIC_REDIRECT_URI:-http://localhost:8765/callback}
+    ports:
+      - "127.0.0.1:8765:8765"
+    command: ["--help"]
 
   frontend:
     build:

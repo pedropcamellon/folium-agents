@@ -6,6 +6,28 @@ The project separates agent behavior from vendor-specific connectors, which
 own authentication, API calls, and mapping EHR data into stable agent-facing
 contracts.
 
+## Run the app
+
+Start Docker Desktop. From the `folium-agents` repository root, with your
+Epic sandbox and model settings configured, run:
+
+```bash
+docker compose up --build
+```
+
+Open **http://localhost:3000** after the services start. Select a sandbox
+patient and authorize Epic access in the chat. The API runs at
+http://localhost:8000; the CLI is optional and does not start with the web app.
+
+First-time setup: see [Epic and model configuration](docs/epic-chat.md#epic-and-model-configuration)
+for `.env` settings, model credentials, and the registered Epic callback.
+Use synthetic sandbox data only; local Compose logs model answers.
+
+Press `Ctrl+C` to stop, then run `docker compose down` to remove the containers.
+Do not add `-v` unless you intend to delete saved connections and keys.
+
+## Architecture
+
 Connectors are developed and validated independently against authorized
 sandbox or synthetic data. They should use supported APIs, least-privilege
 access, preserve source provenance, and avoid writes unless a separately
