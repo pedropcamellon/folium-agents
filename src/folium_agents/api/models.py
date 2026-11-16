@@ -36,6 +36,19 @@ class CreatedSession(BaseModel):
     authorization_url: str = Field(alias="authorizationUrl")
 
 
+class CreatedPatientListSession(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    session_id: str = Field(alias="sessionId")
+    authorization_url: str = Field(alias="authorizationUrl")
+
+
+class PatientListProbeStatus(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    status_code: int = Field(alias="statusCode")
+
+
 class ChatTurn(BaseModel):
     question: str = Field(min_length=1, max_length=4000)
 

@@ -6,10 +6,12 @@ import {
   ChatResponse,
   clearSession,
   ConnectionStatus,
+  createPatientListSession,
   createSession,
   getConnectionStatus,
   getPatientProfile,
   PatientProfile,
+  probePatientListSession,
   sendMessage,
 } from "@/lib/api";
 
@@ -20,6 +22,8 @@ type Turn = {
 };
 
 const ACTIVE_SESSION_STORAGE_KEY = "folium-agents-active-session";
+const ACTIVE_PATIENT_LIST_SESSION_STORAGE_KEY =
+  "folium-agents-active-patient-list-session";
 
 function messageFromError(reason: unknown, fallback: string): string {
   return reason instanceof Error ? reason.message : fallback;
@@ -33,6 +37,9 @@ export default function Chat() {
   const [contextLoading, setContextLoading] = useState(false);
   const [patientId, setPatientId] = useState("");
   const [patientBusy, setPatientBusy] = useState(false);
+  const [patientListSessionId, setPatientListSessionId] = useState("");
+  const [patientListBusy, setPatientListBusy] = useState(false);
+  const [patientListMessage, setPatientListMessage] = useState("");
   const [turns, setTurns] = useState<Turn[]>([]);
   const [question, setQuestion] = useState("");
   const [busy, setBusy] = useState(false);
@@ -95,6 +102,69 @@ export default function Chat() {
   }, []);
 
   useEffect(() => {
+    const url = new URL(window.location.href);
+    const connectedSessionId = url.searchParams.get("epic_list_session_id");
+    const authorizationError = url.searchParams.get("epic_list_error");
+    if (!connectedSessionId && !authorizationError) {
+      const savedSessionId = window.localStorage.getItem(
+        ACTIVE_PATIENT_LIST_SESSION_STORAGE_KEY,
+      );
+      if (savedSessionId) setPatientListSessionId(savedSessionId);
+      return;
+    }
+
+    url.searchParams.delete("epic_list_session_id");
+    url.searchParams.delete("epic_list_error");
+    window.history.replaceState(
+      null,
+      "",
+      `${url.pathname}${url.search}${url.hash}`,
+    );
+
+    if (authorizationError) {
+      setPatientListMessage(
+        "Epic patient-list authorization did not complete. Check the app's Epic permissions and try again.",
+      );
+      return;
+    }
+
+    if (!connectedSessionId) return;
+    window.localStorage.setItem(
+      ACTIVE_PATIENT_LIST_SESSION_STORAGE_KEY,
+      connectedSessionId,
+    );
+    setPatientListSessionId(connectedSessionId);
+    setPatientListBusy(true);
+    void probePatientListSession(connectedSessionId)
+      .then(({ statusCode }) => {
+        setPatientListMessage(
+          `Epic returned HTTP ${statusCode} for the no-filter /List probe. No list or patient data was loaded.`,
+        );
+        if (statusCode === 401) {
+          setPatientListSessionId("");
+          window.localStorage.removeItem(
+            ACTIVE_PATIENT_LIST_SESSION_STORAGE_KEY,
+          );
+        }
+      })
+      .catch((reason: unknown) => {
+        setPatientListMessage(
+          messageFromError(reason, "The Epic List probe failed."),
+        );
+        if (
+          reason instanceof ApiRequestError &&
+          [401, 404].includes(reason.status)
+        ) {
+          setPatientListSessionId("");
+          window.localStorage.removeItem(
+            ACTIVE_PATIENT_LIST_SESSION_STORAGE_KEY,
+          );
+        }
+      })
+      .finally(() => setPatientListBusy(false));
+  }, []);
+
+  useEffect(() => {
     endRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [turns, retrieving]);
 
@@ -132,6 +202,45 @@ export default function Chat() {
   function openPatientDialog() {
     setError("");
     patientDialog.current?.showModal();
+  }
+
+  async function connectOrProbePatientLists() {
+    setPatientListBusy(true);
+    setPatientListMessage("");
+    try {
+      if (patientListSessionId) {
+        const { statusCode } =
+          await probePatientListSession(patientListSessionId);
+        setPatientListMessage(
+          `Epic returned HTTP ${statusCode} for the no-filter /List probe. No list or patient data was loaded.`,
+        );
+        if (statusCode === 401) {
+          setPatientListSessionId("");
+          window.localStorage.removeItem(
+            ACTIVE_PATIENT_LIST_SESSION_STORAGE_KEY,
+          );
+        }
+        setPatientListBusy(false);
+        return;
+      }
+
+      const session = await createPatientListSession();
+      window.location.assign(session.authorizationUrl);
+    } catch (reason) {
+      setPatientListMessage(
+        messageFromError(reason, "Could not connect to Epic patient-list access."),
+      );
+      if (
+        reason instanceof ApiRequestError &&
+        [401, 404].includes(reason.status)
+      ) {
+        setPatientListSessionId("");
+        window.localStorage.removeItem(
+          ACTIVE_PATIENT_LIST_SESSION_STORAGE_KEY,
+        );
+      }
+      setPatientListBusy(false);
+    }
   }
 
   async function submit(event: FormEvent<HTMLFormElement>) {
@@ -186,11 +295,28 @@ export default function Chat() {
           <span>Talk to your EHR</span>
         </div>
         <div className="topbar-user">
+          <button
+            className="topbar-list-button"
+            onClick={connectOrProbePatientLists}
+            disabled={patientListBusy}
+            title="Requests provider-level user/List.rs access only. Does not authorize or load a patient chart."
+          >
+            {patientListBusy
+              ? "Connecting..."
+              : patientListSessionId
+                ? "Probe Epic /List"
+                : "Connect Epic Lists"}
+          </button>
           <span className="user-avatar" aria-hidden="true">S</span>
           <span>Demo workspace</span>
         </div>
       </header>
       <main className="page-content chat-page">
+        {patientListMessage && (
+          <p className="list-probe-status" role="status">
+            {patientListMessage}
+          </p>
+        )}
         <section className="patient-banner">
           <div className="patient-avatar" aria-hidden="true">P</div>
           <div className="patient-identity">

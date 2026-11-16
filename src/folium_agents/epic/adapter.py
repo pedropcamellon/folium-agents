@@ -17,7 +17,12 @@ from folium_agents.core.ehr import (
     EvidenceRecord,
     PatientDemographics,
 )
-from folium_agents.epic.epic import MEDICATION_REVIEW_SCOPE, EpicConfig, EpicSmartClient
+from folium_agents.epic.epic import (
+    MEDICATION_REVIEW_SCOPE,
+    PATIENT_LIST_SCOPE,
+    EpicConfig,
+    EpicSmartClient,
+)
 from folium_agents.epic.financial_reads import (
     ClaimSearch,
     search_claims,
@@ -41,6 +46,16 @@ class SavedEpicConnection(BaseModel):
     binding: str
 
 
+class SavedEpicPatientListConnection(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    smart: SmartConfiguration
+    token: EpicToken
+    expires_at: float
+    connection_expires_at: float
+    binding: str
+
+
 @dataclass
 class EpicSession:
     patient_id: str
@@ -52,11 +67,25 @@ class EpicSession:
     connection_expires_at: float = 0
 
 
+@dataclass
+class EpicPatientListSession:
+    smart: SmartConfiguration
+    state: str
+    verifier: str
+    binding: str
+    authorization_expires_at: float
+    token: EpicToken | None = None
+    expires_at: float | None = None
+    connection_expires_at: float = 0
+
+
 class EpicConnector:
     name = "epic"
+    patient_list_session_ttl = 24 * 60 * 60
 
     def __init__(self) -> None:
         self._sessions: dict[str, EpicSession] = {}
+        self._patient_list_sessions: dict[str, EpicPatientListSession] = {}
         self._store = connection_store()
         self._refresh_lock = asyncio.Lock()
 
@@ -81,6 +110,113 @@ class EpicConnector:
                 },
                 session.connection_expires_at,
             )
+
+    async def start_patient_list_authorization(
+        self,
+        session_id: str,
+    ) -> AuthorizationRequest:
+        config = self._patient_list_config()
+        client = EpicSmartClient(config)
+        smart = await client.discover()
+        state = client.create_state()
+        verifier, challenge = client.create_pkce_pair()
+        authorization_url = client.build_authorization_url(
+            smart,
+            state=state,
+            code_challenge=challenge,
+        )
+        now = time.time()
+        self._patient_list_sessions[session_id] = EpicPatientListSession(
+            smart=smart,
+            state=state,
+            verifier=verifier,
+            binding=self._patient_list_binding(),
+            authorization_expires_at=now + 5 * 60,
+            connection_expires_at=now + self.patient_list_session_ttl,
+        )
+        return AuthorizationRequest(state=state, authorization_url=authorization_url)
+
+    def patient_list_session_id_for_state(self, state: str) -> str | None:
+        for session_id, session in list(self._patient_list_sessions.items()):
+            if (
+                session.token is None
+                and session.authorization_expires_at <= time.time()
+            ):
+                self.end_patient_list_session(session_id)
+                continue
+            if session.state and secrets.compare_digest(session.state, state):
+                return session_id
+        return None
+
+    async def complete_patient_list_authorization(
+        self,
+        session_id: str,
+        *,
+        state: str,
+        code: str,
+    ) -> None:
+        session = self._patient_list_session(session_id)
+        if not secrets.compare_digest(session.state, state):
+            raise ValueError("OAuth state mismatch; refusing token exchange.")
+        token = await EpicSmartClient(self._patient_list_config()).exchange_code(
+            session.smart,
+            code=code,
+            returned_state=state,
+            expected_state=session.state,
+            code_verifier=session.verifier,
+        )
+        lifetime = self._validate_patient_list_token(token)
+        session.token = token
+        session.expires_at = time.time() + lifetime
+        session.state = ""
+        session.verifier = ""
+        self._save_patient_list_session(session_id, session)
+
+    async def probe_patient_list_search(self, session_id: str) -> int:
+        session = self._patient_list_session(session_id)
+        token = session.token
+        if token is None:
+            raise EpicReauthorizationRequired(
+                "Epic patient-list authorization is unavailable. Reconnect."
+            )
+        if session.expires_at is None or session.expires_at <= time.time() + 30:
+            if not token.refresh_token:
+                self.end_patient_list_session(session_id)
+                raise EpicReauthorizationRequired(
+                    "Epic patient-list authorization expired. Reconnect."
+                )
+            try:
+                refreshed = await EpicSmartClient(
+                    self._patient_list_config()
+                ).refresh_access_token(session.smart, token.refresh_token)
+            except httpx.HTTPStatusError as error:
+                if error.response.status_code not in {400, 401}:
+                    raise
+                self.end_patient_list_session(session_id)
+                raise EpicReauthorizationRequired(
+                    "Epic patient-list authorization expired. Reconnect."
+                ) from None
+            if refreshed.scope is None:
+                refreshed.scope = token.scope
+            if refreshed.refresh_token is None:
+                refreshed.refresh_token = token.refresh_token
+            lifetime = self._validate_patient_list_token(refreshed)
+            session.token = refreshed
+            session.expires_at = time.time() + lifetime
+            self._save_patient_list_session(session_id, session)
+            token = refreshed
+
+        status_code = await EpicSmartClient(
+            self._patient_list_config()
+        ).probe_unfiltered_patient_lists(token.access_token)
+        if status_code == 401:
+            self.end_patient_list_session(session_id)
+        return status_code
+
+    def end_patient_list_session(self, session_id: str) -> None:
+        self._patient_list_sessions.pop(session_id, None)
+        if self._store:
+            self._store.delete("epic-provider-list", session_id)
 
     async def start_authorization(
         self,
@@ -301,6 +437,83 @@ class EpicConnector:
             if candidate is session and self._store:
                 self._store.delete("epic", session_id)
 
+    def _save_patient_list_session(
+        self,
+        session_id: str,
+        session: EpicPatientListSession,
+    ) -> None:
+        if self._store and session.token and session.expires_at is not None:
+            self._store.save(
+                "epic-provider-list",
+                session_id,
+                SavedEpicPatientListConnection(
+                    smart=session.smart,
+                    token=session.token,
+                    expires_at=session.expires_at,
+                    connection_expires_at=session.connection_expires_at,
+                    binding=session.binding,
+                ).model_dump(),
+                session.connection_expires_at,
+            )
+
+    def _patient_list_session(self, session_id: str) -> EpicPatientListSession:
+        session = self._patient_list_sessions.get(session_id)
+        if session is None and self._store:
+            payload = self._store.load("epic-provider-list", session_id)
+            if payload:
+                saved = SavedEpicPatientListConnection.model_validate(payload)
+                if saved.binding != self._patient_list_binding():
+                    self._store.delete("epic-provider-list", session_id)
+                    raise EpicReauthorizationRequired(
+                        "Epic patient-list authorization changed. Reconnect."
+                    )
+                self._validate_patient_list_token(saved.token)
+                session = EpicPatientListSession(
+                    smart=saved.smart,
+                    state="",
+                    verifier="",
+                    binding=saved.binding,
+                    authorization_expires_at=0,
+                    token=saved.token,
+                    expires_at=saved.expires_at,
+                    connection_expires_at=saved.connection_expires_at,
+                )
+                self._patient_list_sessions[session_id] = session
+        if session is None:
+            raise EpicReauthorizationRequired(
+                "Epic patient-list authorization is unavailable. Reconnect."
+            )
+        if session.binding != self._patient_list_binding():
+            self.end_patient_list_session(session_id)
+            raise EpicReauthorizationRequired(
+                "Epic patient-list authorization changed. Reconnect."
+            )
+        if session.connection_expires_at <= time.time():
+            self.end_patient_list_session(session_id)
+            raise EpicReauthorizationRequired(
+                "Epic patient-list authorization expired. Reconnect."
+            )
+        if session.token is None and session.authorization_expires_at <= time.time():
+            self.end_patient_list_session(session_id)
+            raise EpicReauthorizationRequired(
+                "Epic patient-list authorization was not completed. Reconnect."
+            )
+        if session.token is not None:
+            self._validate_patient_list_token(session.token)
+        return session
+
+    @staticmethod
+    def _validate_patient_list_token(token: EpicToken) -> int:
+        if token.patient is not None:
+            raise EpicReauthorizationRequired(
+                "Epic returned patient-bound access for provider List access."
+            )
+        if not token.access_token or token.expires_in is None or token.expires_in <= 0:
+            raise EpicReauthorizationRequired(
+                "Epic patient-list authorization is invalid. Reconnect."
+            )
+        return token.expires_in
+
     def _handle_fhir_rejection(
         self,
         session: EpicSession,
@@ -373,6 +586,18 @@ class EpicConnector:
     def _config() -> EpicConfig:
         return EpicConfig.from_environment().model_copy(
             update={"scope": MEDICATION_REVIEW_SCOPE}
+        )
+
+    @staticmethod
+    def _patient_list_config() -> EpicConfig:
+        return EpicConfig.from_environment().model_copy(
+            update={"scope": PATIENT_LIST_SCOPE}
+        )
+
+    def _patient_list_binding(self) -> str:
+        config = self._patient_list_config()
+        return (
+            f"{config.issuer}|{config.client_id}|{config.redirect_uri}|{config.scope}"
         )
 
 

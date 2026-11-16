@@ -69,6 +69,30 @@ clears the conversation and starts a new authorization context. Use the
 same hostname for the app and registered callback (for example, `localhost`)
 so the browser can return the session.
 
+## Provider-level List probe
+
+The chat header includes **Connect Epic Lists** as a separate provider-context
+OAuth flow. It requests `openid fhirUser user/List.rs` only; it does not request
+patient-context or wildcard scopes. The OAuth token stays server-side in the
+encrypted connection store, separate from patient-bound chat sessions. The
+button then sends one no-query `GET /List` request and displays only its HTTP
+status. It does not read or return a List response body, list identifiers, or
+patient data.
+
+This is an experimental capability probe, not the patient table or proof of an
+all-patient cohort. Epic's documented `List.Search (Patient List) (R4)` requires
+`code=patients` and a specific `identifier`; Epic app registration and the
+clinician user's security must also allow the API. A denied scope or request is
+reported as a failed probe. A successful status alone does not establish
+complete patient coverage. See the [List.Search specification](https://fhir.epic.com/Specifications?api=10519).
+
+Live sandbox observation (2026-11-16): after returning from Epic OAuth, the
+no-query `/List` probe returned HTTP 400. The response body was not read. This
+shows that this bare request was rejected; it does not establish an
+authorization failure or confirm List access. The documented search requires
+`code=patients` and a specific `identifier`, so those filters must be tested
+separately before drawing conclusions about List access or patient coverage.
+
 The Epic app must enable the required MedicationRequest, AllergyIntolerance,
 Condition, Patient, and ExplanationOfBenefit interactions for the relevant
 user types. Epic may return the EOB read and search permissions separately as

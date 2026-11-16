@@ -16,7 +16,12 @@ from folium_agents.api import app as api
 from folium_agents.api.models import ChatMessage
 from folium_agents.core.connections import ConnectionStore
 from folium_agents.epic.adapter import EpicConnector
-from folium_agents.epic.epic import MEDICATION_REVIEW_SCOPE, EpicConfig, EpicSmartClient
+from folium_agents.epic.epic import (
+    MEDICATION_REVIEW_SCOPE,
+    PATIENT_LIST_SCOPE,
+    EpicConfig,
+    EpicSmartClient,
+)
 from folium_agents.epic.models import EpicToken, SmartConfiguration
 
 
@@ -97,6 +102,214 @@ def test_patient_authorization_requests_combined_explicit_scopes(
     assert "patient/MedicationRequest.rs" in scopes
     assert "user/ExplanationOfBenefit.rs" in scopes
     assert not any(scope.startswith("system/") for scope in scopes)
+
+
+def test_provider_patient_list_flow_uses_separate_oauth_and_status_only_probe(
+    persistent_connections,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = EpicConfig(
+        _env_file=None,
+        client_id="synthetic-client",
+        redirect_uri="https://app.example.test/api/epic/callback",
+        scope=PATIENT_LIST_SCOPE,
+    )
+    monkeypatch.setattr(
+        EpicConnector,
+        "_patient_list_config",
+        staticmethod(lambda: config),
+    )
+
+    async def exchange(_self, _smart, **kwargs):
+        assert kwargs["code"] == "synthetic-provider-code"
+        return EpicToken(
+            access_token="synthetic-list-token",
+            refresh_token="synthetic-list-refresh",
+            expires_in=3600,
+            scope=PATIENT_LIST_SCOPE,
+        )
+
+    async def probe(_self, access_token, *, issuer=None):
+        assert access_token == "synthetic-list-token"
+        assert issuer is None
+        return 400
+
+    monkeypatch.setattr(EpicSmartClient, "exchange_code", exchange)
+    monkeypatch.setattr(
+        EpicSmartClient,
+        "probe_unfiltered_patient_lists",
+        probe,
+    )
+    client = TestClient(api.app, follow_redirects=False)
+    connector = api.connectors["epic"]
+    assert isinstance(connector, EpicConnector)
+
+    created = client.post("/api/epic/patient-list-sessions")
+
+    assert created.status_code == 200
+    result = created.json()
+    session_id = result["sessionId"]
+    scopes = parse_qs(urlparse(result["authorizationUrl"]).query)["scope"][0].split()
+    assert scopes == PATIENT_LIST_SCOPE.split()
+    assert "patient/List.rs" not in scopes
+    state = connector._patient_list_sessions[session_id].state
+
+    callback = client.get(
+        "/api/epic/callback",
+        params={"state": state, "code": "synthetic-provider-code"},
+    )
+
+    assert callback.status_code == 307
+    assert callback.headers["location"].endswith(
+        f"/?epic_list_session_id={session_id}"
+    )
+
+    probe_response = client.post(
+        f"/api/epic/patient-list-sessions/{session_id}/probe",
+    )
+
+    assert probe_response.status_code == 200
+    assert probe_response.json() == {"statusCode": 400}
+    assert "synthetic-list-token" not in probe_response.text
+
+
+def test_provider_patient_list_flow_rejects_patient_bound_oauth_token(
+    persistent_connections,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = EpicConfig(
+        _env_file=None,
+        client_id="synthetic-client",
+        redirect_uri="https://app.example.test/api/epic/callback",
+        scope=PATIENT_LIST_SCOPE,
+    )
+    monkeypatch.setattr(
+        EpicConnector,
+        "_patient_list_config",
+        staticmethod(lambda: config),
+    )
+
+    async def exchange(_self, _smart, **_kwargs):
+        return EpicToken(
+            access_token="synthetic-patient-token",
+            expires_in=3600,
+            patient="synthetic-patient",
+        )
+
+    monkeypatch.setattr(EpicSmartClient, "exchange_code", exchange)
+    client = TestClient(api.app, follow_redirects=False)
+    connector = api.connectors["epic"]
+    assert isinstance(connector, EpicConnector)
+    created = client.post("/api/epic/patient-list-sessions")
+    session_id = created.json()["sessionId"]
+    state = connector._patient_list_sessions[session_id].state
+
+    callback = client.get(
+        "/api/epic/callback",
+        params={"state": state, "code": "synthetic-provider-code"},
+    )
+
+    assert callback.status_code == 307
+    assert callback.headers["location"].endswith(
+        "/?epic_list_error=authorization"
+    )
+    assert session_id not in connector._patient_list_sessions
+
+
+def test_provider_patient_list_refresh_preserves_omitted_refresh_token(
+    persistent_connections,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = EpicConfig(
+        _env_file=None,
+        client_id="synthetic-client",
+        redirect_uri="https://app.example.test/api/epic/callback",
+        scope=PATIENT_LIST_SCOPE,
+    )
+    monkeypatch.setattr(
+        EpicConnector,
+        "_patient_list_config",
+        staticmethod(lambda: config),
+    )
+
+    async def exchange(_self, _smart, **_kwargs):
+        return EpicToken(
+            access_token="synthetic-list-token",
+            refresh_token="synthetic-list-refresh",
+            expires_in=3600,
+            scope=PATIENT_LIST_SCOPE,
+        )
+
+    async def refresh(_self, _smart, refresh_token):
+        assert refresh_token == "synthetic-list-refresh"
+        return EpicToken(
+            access_token="synthetic-refreshed-list-token",
+            expires_in=3600,
+            scope=PATIENT_LIST_SCOPE,
+        )
+
+    async def probe(_self, access_token, *, issuer=None):
+        assert access_token == "synthetic-refreshed-list-token"
+        assert issuer is None
+        return 200
+
+    monkeypatch.setattr(EpicSmartClient, "exchange_code", exchange)
+    monkeypatch.setattr(EpicSmartClient, "refresh_access_token", refresh)
+    monkeypatch.setattr(
+        EpicSmartClient,
+        "probe_unfiltered_patient_lists",
+        probe,
+    )
+    client = TestClient(api.app, follow_redirects=False)
+    connector = api.connectors["epic"]
+    assert isinstance(connector, EpicConnector)
+
+    created = client.post("/api/epic/patient-list-sessions")
+    session_id = created.json()["sessionId"]
+    state = connector._patient_list_sessions[session_id].state
+    callback = client.get(
+        "/api/epic/callback",
+        params={"state": state, "code": "synthetic-provider-code"},
+    )
+    assert callback.status_code == 307
+    connector._patient_list_sessions[session_id].expires_at = time.time() - 1
+
+    response = client.post(
+        f"/api/epic/patient-list-sessions/{session_id}/probe",
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"statusCode": 200}
+    refreshed_token = connector._patient_list_sessions[session_id].token
+    assert refreshed_token is not None
+    assert refreshed_token.refresh_token == "synthetic-list-refresh"
+
+
+def test_unfiltered_patient_list_probe_does_not_parse_response_body() -> None:
+    def handle(request: httpx.Request) -> httpx.Response:
+        assert request.method == "GET"
+        assert str(request.url) == "https://ehr.example.test/fhir/List"
+        assert request.headers["Authorization"] == "Bearer synthetic-token"
+        return httpx.Response(400, content=b"not a FHIR response")
+
+    async def run() -> int:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handle),
+        ) as http_client:
+            client = EpicSmartClient(
+                EpicConfig(
+                    _env_file=None,
+                    client_id="synthetic-client",
+                    redirect_uri="https://app.example.test/callback",
+                ),
+                http_client=http_client,
+            )
+            return await client.probe_unfiltered_patient_lists(
+                "synthetic-token",
+                issuer="https://ehr.example.test/fhir",
+            )
+
+    assert asyncio.run(run()) == 400
 
 
 def test_patient_claim_search_uses_shared_session_and_all_dates(

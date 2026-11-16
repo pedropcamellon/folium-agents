@@ -91,6 +91,13 @@ logging so the authorization code in the callback URL is not written to
 container logs. After authorization, the callback returns to the same root
 chat view with the patient context active.
 
+The chat header also has **Connect Epic Lists** for a separate, provider-context
+OAuth grant. It requests `openid fhirUser user/List.rs`, then probes `GET /List`
+without query parameters. The UI displays only the HTTP status; it does not
+load patient data or populate a patient table. This is an experimental
+authorization/API probe, separate from Patient Scope and not evidence of
+all-patient access. See [Epic sandbox behavior and proof](./epic-sandbox.md).
+
 The clinical interface is a local synthetic-data demo, not an EHR application.
 The browser connects to port 8000 on the same hostname used for the frontend,
 supporting both `localhost` and `127.0.0.1`. If the UI reports that it cannot

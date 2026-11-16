@@ -21,6 +21,10 @@ export type ConnectionStatus = {
   patientId: string;
 };
 
+export type PatientListProbeStatus = {
+  statusCode: number;
+};
+
 export type PatientProfile = {
   patientId: string;
   givenName: string | null;
@@ -84,6 +88,8 @@ type ApiOperation =
   | "patient"
   | "disconnect"
   | "authorize"
+  | "authorize_epic_list"
+  | "probe_epic_list"
   | "restore"
   | "search_epic_claims"
   | "list_financial_claims"
@@ -213,6 +219,24 @@ export async function createSession(patientId: string) {
     method: "POST",
     body: JSON.stringify({ patientId }),
   });
+}
+
+export function createPatientListSession() {
+  return request<{
+    sessionId: string;
+    authorizationUrl: string;
+  }>("authorize_epic_list", "/api/epic/patient-list-sessions", {
+    method: "POST",
+    body: JSON.stringify({}),
+  });
+}
+
+export function probePatientListSession(sessionId: string) {
+  return request<PatientListProbeStatus>(
+    "probe_epic_list",
+    `/api/epic/patient-list-sessions/${encodeURIComponent(sessionId)}/probe`,
+    { method: "POST" },
+  );
 }
 
 export function getConnectionStatus(sessionId: string) {

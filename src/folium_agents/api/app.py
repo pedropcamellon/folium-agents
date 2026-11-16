@@ -31,8 +31,10 @@ from folium_agents.api.models import (
     ChatSource,
     ChatTurn,
     ConnectionStatus,
+    CreatedPatientListSession,
     CreatedSession,
     GroundedAnswer,
+    PatientListProbeStatus,
     PatientProfile,
     PatientSelection,
     SavedChatConnection,
@@ -246,6 +248,29 @@ async def create_session(selection: PatientSelection) -> CreatedSession:
     )
 
 
+@app.post(
+    "/api/epic/patient-list-sessions",
+    response_model=CreatedPatientListSession,
+)
+async def create_patient_list_session() -> CreatedPatientListSession:
+    connector = connectors.get("epic")
+    if not isinstance(connector, EpicConnector):
+        raise HTTPException(status_code=404, detail="Epic is unavailable.")
+    session_id = secrets.token_urlsafe(32)
+    try:
+        authorization = await connector.start_patient_list_authorization(session_id)
+    except (httpx.HTTPError, ValueError) as error:
+        diagnostic("oauth.patient_list_start_failed", error=error)
+        raise HTTPException(
+            status_code=502,
+            detail="Epic patient-list authorization could not be started.",
+        ) from error
+    return CreatedPatientListSession(
+        session_id=session_id,
+        authorization_url=authorization.authorization_url,
+    )
+
+
 @app.get("/api/{provider_id}/callback")
 async def connector_callback(
     provider_id: str,
@@ -254,6 +279,35 @@ async def connector_callback(
     error: str | None = None,
 ) -> RedirectResponse:
     _prune_expired_sessions()
+    connector = connectors.get(provider_id)
+    if provider_id == "epic" and isinstance(connector, EpicConnector):
+        patient_list_session_id = connector.patient_list_session_id_for_state(state)
+        if patient_list_session_id is not None:
+            if error or not code:
+                connector.end_patient_list_session(patient_list_session_id)
+                diagnostic("oauth.patient_list_denied")
+                return RedirectResponse(
+                    f"{settings.frontend_origin}/?"
+                    f"{urlencode({'epic_list_error': 'authorization'})}"
+                )
+            try:
+                await connector.complete_patient_list_authorization(
+                    patient_list_session_id,
+                    state=state,
+                    code=code,
+                )
+            except (httpx.HTTPError, ValueError) as exception:
+                connector.end_patient_list_session(patient_list_session_id)
+                diagnostic("oauth.patient_list_exchange_failed", error=exception)
+                return RedirectResponse(
+                    f"{settings.frontend_origin}/?"
+                    f"{urlencode({'epic_list_error': 'authorization'})}"
+                )
+            diagnostic("oauth.patient_list_connected")
+            return RedirectResponse(
+                f"{settings.frontend_origin}/?"
+                f"{urlencode({'epic_list_session_id': patient_list_session_id})}"
+            )
     session_id = next(
         (
             key
@@ -314,6 +368,28 @@ async def connector_callback(
     return RedirectResponse(
         f"{settings.frontend_origin}/?{urlencode({'session_id': session_id})}"
     )
+
+
+@app.post(
+    "/api/epic/patient-list-sessions/{session_id}/probe",
+    response_model=PatientListProbeStatus,
+)
+async def probe_patient_list_session(session_id: str) -> PatientListProbeStatus:
+    connector = connectors.get("epic")
+    if not isinstance(connector, EpicConnector):
+        raise HTTPException(status_code=404, detail="Epic is unavailable.")
+    try:
+        status_code = await connector.probe_patient_list_search(session_id)
+    except EpicReauthorizationRequired as error:
+        diagnostic("oauth.patient_list_unavailable", error=error)
+        raise HTTPException(status_code=401, detail=str(error)) from error
+    except httpx.HTTPError as error:
+        diagnostic("fhir.patient_list_probe_failed", error=error)
+        raise HTTPException(
+            status_code=502,
+            detail="Epic patient-list request could not be completed.",
+        ) from error
+    return PatientListProbeStatus(status_code=status_code)
 
 
 @app.get("/api/sessions/{session_id}", response_model=ConnectionStatus)

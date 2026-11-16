@@ -49,6 +49,22 @@ separate Epic SDK exists or provides a capability.
   never reuse a patient-restricted grant for another patient. Backend/system
   authorization is a separate approved integration, not an admin shortcut.
 
+## Patient List discovery
+
+- Epic's documented `List.Search (Patient List) (R4)` requires `code=patients`
+  and a specific `identifier`; My Lists must belong to or be shared with the
+  user. Do not assume a list ID can be discovered by searching all Lists.
+- A provider-context `user/List.rs` grant and no-query `GET /List` are only an
+  experimental authorization/API probe. Keep that token separate from the
+  patient-bound chat grant, do not request wildcard or patient scopes, and do
+  not read or return response bodies in status-only probes.
+- A successful no-query response does not prove that the endpoint returns all
+  patients, identifies a usable patient cohort, or supports patient switching.
+  Verify the specific List API, provider user type, app registration, and
+  authorized List identifiers before implementing patient discovery.
+- General FHIR examples from other servers (such as unfiltered `GET /Patient`)
+  do not establish Epic sandbox behavior.
+
 ## Claims: the important request distinction
 
 For the implemented patient claim workflow:
@@ -150,4 +166,4 @@ Public references:
 - [Epic Claim Search specification](https://fhir.epic.com/Specifications?api=1073)
 - [Epic sandbox test data](https://fhir.epic.com/Documentation?docId=testpatients)
 
-Last reviewed: 2026-11-15.
+Last reviewed: 2026-11-16.

@@ -42,6 +42,7 @@ from folium_agents.epic.models import (
 
 DEFAULT_EPIC_FHIR_ISSUER = "https://fhir.epic.com/interconnect-fhir-oauth/api/FHIR/R4"
 DEFAULT_EPIC_SCOPE = "openid fhirUser user/Patient.rs"
+PATIENT_LIST_SCOPE = "openid fhirUser user/List.rs"
 MEDICATION_REVIEW_SCOPE = (
     "openid fhirUser launch/patient patient/MedicationRequest.rs "
     "patient/AllergyIntolerance.rs patient/Condition.rs patient/Patient.r "
@@ -357,6 +358,30 @@ class EpicSmartClient:
             total=bundle.total,
             patients=[entry.resource for entry in bundle.entry],
         )
+
+    async def probe_unfiltered_patient_lists(
+        self,
+        access_token: str,
+        *,
+        issuer: str | None = None,
+    ) -> int:
+        if not access_token:
+            raise ValueError("An access token is required.")
+
+        url = f"{(issuer or self._config.issuer).rstrip('/')}/List"
+        headers = {
+            "Accept": "application/fhir+json",
+            "Authorization": f"Bearer {access_token}",
+        }
+        if self._http_client is not None:
+            async with self._http_client.stream("GET", url, headers=headers) as response:
+                return response.status_code
+
+        async with (
+            httpx.AsyncClient(timeout=20.0) as client,
+            client.stream("GET", url, headers=headers) as response,
+        ):
+            return response.status_code
 
     async def get_patient(
         self,
