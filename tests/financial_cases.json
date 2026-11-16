@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "development": [
+    {"claim": "SYN-001", "branch": "review_preview", "after": 2000},
+    {"claim": "SYN-002", "branch": "obtain_evidence"},
+    {"claim": "SYN-003", "branch": "no_posting"},
+    {"claim": "SYN-004", "branch": "escalate"}
+  ],
+  "holdout": [
+    {"claim": "SYN-005", "branch": "escalate"},
+    {"claim": "SYN-006", "branch": "review_preview", "after": 6000}
+  ],
+  "safety": ["no_mutations", "no_external_actions", "no_invented_money", "no_wrong_claim_evidence"],
+  "pending": ["quality_thresholds", "candidate_evaluation_bound_approval"],
+  "baseline": "Read claim, remittances and postings once, then summarize without adaptive calls. Compare branch accuracy, citations, supported amounts, disclosure, calls and latency."
+}

@@ -61,6 +61,7 @@ class EpicToken(BaseModel):
     refresh_token: str | None = None
     patient: str | None = None
     encounter: str | None = None
+    scope: str | None = None
 
 
 class CachedEpicToken(BaseModel):
@@ -100,7 +101,11 @@ class EpicPatient(BaseModel):
     @property
     def primary_name(self) -> EpicPatientName | None:
         return next(
-            (patient_name for patient_name in self.name if patient_name.given or patient_name.family),
+            (
+                patient_name
+                for patient_name in self.name
+                if patient_name.given or patient_name.family
+            ),
             None,
         )
 
@@ -116,20 +121,30 @@ class EpicPatient(BaseModel):
 
 
 class PatientBundleEntry(BaseModel):
-    resource: EpicPatient
+    resource: dict[str, Any]
 
 
 class EpicPatientSearchResult(BaseModel):
     total: int | None = None
     patients: list[EpicPatient]
+    more_matches_available: bool = False
+
+
+class EpicPatientBundleLink(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    relation: str
+    url: str
 
 
 class EpicPatientBundle(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     resource_type: Literal["Bundle"] = Field(alias="resourceType")
+    bundle_type: str = Field(alias="type")
     total: int | None = None
     entry: list[PatientBundleEntry] = Field(default_factory=list)
+    link: list[EpicPatientBundleLink] = Field(default_factory=list)
 
 
 class FhirCoding(BaseModel):
@@ -282,6 +297,7 @@ class FhirOperationIssue(BaseModel):
 
     severity: Literal["fatal", "error", "warning", "information", "success"]
     code: str
+    details: FhirCodeableConcept | None = None
 
 
 class FhirOperationOutcome(BaseModel):

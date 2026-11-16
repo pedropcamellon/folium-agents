@@ -7,6 +7,7 @@ import hmac
 import re
 import secrets
 import time
+from datetime import date
 from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urlencode
@@ -14,6 +15,8 @@ from urllib.parse import urlencode
 import httpx
 import jwt
 import keyring
+from cryptography.hazmat.primitives.asymmetric.ec import EllipticCurvePrivateKey
+from cryptography.hazmat.primitives.asymmetric.rsa import RSAPrivateKey
 from cryptography.hazmat.primitives.serialization import load_pem_private_key
 from pydantic import SecretStr, ValidationError
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -42,9 +45,29 @@ DEFAULT_EPIC_FHIR_ISSUER = "https://fhir.epic.com/interconnect-fhir-oauth/api/FH
 DEFAULT_EPIC_SCOPE = "openid fhirUser user/Patient.rs"
 MEDICATION_REVIEW_SCOPE = (
     "openid fhirUser launch/patient patient/MedicationRequest.rs "
-    "patient/AllergyIntolerance.rs patient/Condition.rs patient/Patient.r"
+    "patient/AllergyIntolerance.rs patient/Condition.rs patient/Patient.r "
+    "user/ExplanationOfBenefit.rs"
 )
 TOKEN_KEYRING_SERVICE = "folium-agents-epic"
+
+
+class EpicPatientSearchRejected(ValueError):
+    """Epic returned a FHIR outcome instead of usable patient candidates."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        provider_issue_codes: tuple[str, ...] = (),
+        provider_issue_severities: tuple[str, ...] = (),
+    ) -> None:
+        super().__init__(message)
+        self.provider_issue_codes = provider_issue_codes
+        self.provider_issue_severities = provider_issue_severities
+
+
+class EpicPatientSearchNoResults(EpicPatientSearchRejected):
+    """Epic returned a not-found outcome for an otherwise valid search."""
 
 
 class EpicConfig(BaseSettings):
@@ -304,6 +327,8 @@ class EpicSmartClient:
             else None
         )
         private_key = load_pem_private_key(private_key_bytes, password=passphrase)
+        if not isinstance(private_key, (RSAPrivateKey, EllipticCurvePrivateKey)):
+            raise TypeError("Epic client assertions require an RSA or EC private key.")
         now = int(time.time())
         claims = {
             "iss": config.client_id,
@@ -327,30 +352,169 @@ class EpicSmartClient:
         self,
         access_token: str,
         *,
-        patient_id: str,
+        patient_id: str | None = None,
+        given_name: str | None = None,
+        family_name: str | None = None,
+        birthdate: str | None = None,
         issuer: str | None = None,
     ) -> EpicPatientSearchResult:
         if not access_token:
             raise ValueError("An access token is required.")
-        patient_id = patient_id.strip()
-        if not patient_id:
-            raise ValueError("A Patient FHIR ID is required.")
+        given_name = given_name.strip() if given_name else None
+        family_name = family_name.strip() if family_name else None
+        birthdate = birthdate.strip() if birthdate else None
+        patient_id = patient_id.strip() if patient_id else None
+        demographics = (given_name, family_name, birthdate)
+        if patient_id and any(demographics):
+            raise ValueError("Use either a Patient FHIR ID or demographic search.")
+        if not patient_id and not all((given_name, family_name, birthdate)):
+            raise ValueError(
+                "Provide a given name, family name, and date of birth."
+            )
+        if given_name and len(given_name) > 200:
+            raise ValueError("Patient given name must not exceed 200 characters.")
+        if family_name and len(family_name) > 200:
+            raise ValueError("Patient family name must not exceed 200 characters.")
+        if patient_id and re.fullmatch(r"[A-Za-z0-9.-]{1,64}", patient_id) is None:
+            raise ValueError("A valid Patient FHIR ID is required.")
+        if birthdate:
+            if re.fullmatch(r"\d{4}-\d{2}-\d{2}", birthdate) is None:
+                raise ValueError("Date of birth must use YYYY-MM-DD format.")
+            try:
+                date.fromisoformat(birthdate)
+            except ValueError:
+                raise ValueError("Date of birth must be a valid calendar date.") from None
 
         base_url = (issuer or self._config.issuer).rstrip("/")
+        params = {"_count": "100"} if not patient_id else {"_id": patient_id}
+        if given_name:
+            params["given"] = given_name
+        if family_name:
+            params["family"] = family_name
+        if birthdate:
+            params["birthdate"] = birthdate
         response = await self._request(
             "GET",
             f"{base_url}/Patient",
-            params={"_id": patient_id},
+            params=params,
             headers={
                 "Accept": "application/fhir+json",
                 "Authorization": f"Bearer {access_token}",
             },
         )
         self._raise_for_status_with_operation_outcome(response)
-        bundle = EpicPatientBundle.model_validate(response.json())
+        try:
+            payload = response.json()
+        except ValueError:
+            raise ValueError("Epic returned a non-JSON Patient search response.") from None
+        if isinstance(payload, dict) and payload.get("resourceType") == "OperationOutcome":
+            try:
+                outcome = FhirOperationOutcome.model_validate(payload)
+            except ValidationError:
+                raise ValueError("Epic returned an invalid Patient search outcome.") from None
+            if self._is_patient_search_no_results(outcome):
+                raise self._patient_search_no_results(outcome)
+            if any(
+                issue.severity in {"fatal", "error", "warning"}
+                for issue in outcome.issue
+            ):
+                raise self._patient_search_outcome_rejection(outcome)
+            raise ValueError("Epic returned no usable Patient search results.")
+        try:
+            bundle = EpicPatientBundle.model_validate(payload)
+        except ValidationError:
+            raise ValueError("Epic returned an invalid Patient search response.") from None
+        if bundle.bundle_type != "searchset":
+            raise ValueError("Epic returned a non-search Patient bundle.")
+        patients = []
+        for entry in bundle.entry:
+            if entry.resource.get("resourceType") == "OperationOutcome":
+                try:
+                    outcome = FhirOperationOutcome.model_validate(entry.resource)
+                except ValidationError:
+                    raise ValueError(
+                        "Epic returned an invalid Patient search outcome."
+                    ) from None
+                if (
+                    self._is_patient_search_no_results(outcome)
+                    and bundle.total in (None, 0)
+                    and all(
+                        item.resource.get("resourceType") == "OperationOutcome"
+                        for item in bundle.entry
+                    )
+                ):
+                    raise self._patient_search_no_results(outcome)
+                if any(
+                    issue.severity in {"fatal", "error", "warning"}
+                    for issue in outcome.issue
+                ):
+                    raise self._patient_search_outcome_rejection(outcome)
+                raise ValueError("Epic returned no usable Patient search results.")
+            try:
+                patients.append(EpicPatient.model_validate(entry.resource))
+            except ValidationError:
+                raise ValueError(
+                    "Epic returned an invalid Patient search response."
+                ) from None
+        patient_ids = [patient.id for patient in patients]
+        if (
+            len(patient_ids) != len(set(patient_ids))
+            or any(
+                re.fullmatch(r"[A-Za-z0-9.-]{1,64}", patient_id) is None
+                for patient_id in patient_ids
+            )
+        ):
+            raise ValueError("Epic returned invalid or duplicate Patient search results.")
+        if bundle.total is not None and bundle.total < len(patients):
+            raise ValueError("Epic returned a contradictory Patient search total.")
+        more_matches_available = any(
+            link.relation == "next" for link in bundle.link
+        ) or (bundle.total is not None and bundle.total > len(patients))
         return EpicPatientSearchResult(
             total=bundle.total,
-            patients=[entry.resource for entry in bundle.entry],
+            patients=patients,
+            more_matches_available=more_matches_available,
+        )
+
+    @staticmethod
+    def _patient_search_outcome_rejection(
+        outcome: FhirOperationOutcome,
+    ) -> EpicPatientSearchRejected:
+        rejecting_issues = tuple(
+            issue
+            for issue in outcome.issue
+            if issue.severity in {"fatal", "error", "warning"}
+        )
+        return EpicPatientSearchRejected(
+            "Epic could not return patient candidates. Check your "
+            "organization's minimum demographics and Patient.Search "
+            "support or configuration.",
+            provider_issue_codes=tuple(issue.code for issue in rejecting_issues),
+            provider_issue_severities=tuple(
+                issue.severity for issue in rejecting_issues
+            ),
+        )
+
+    @staticmethod
+    def _is_patient_search_no_results(outcome: FhirOperationOutcome) -> bool:
+        return bool(outcome.issue) and (
+            all(issue.code == "not-found" for issue in outcome.issue)
+            or all(
+                issue.code == "processing" and issue.severity == "warning"
+                for issue in outcome.issue
+            )
+        )
+
+    @staticmethod
+    def _patient_search_no_results(
+        outcome: FhirOperationOutcome,
+    ) -> EpicPatientSearchNoResults:
+        return EpicPatientSearchNoResults(
+            "Epic returned no matching Patient candidates.",
+            provider_issue_codes=tuple(issue.code for issue in outcome.issue),
+            provider_issue_severities=tuple(
+                issue.severity for issue in outcome.issue
+            ),
         )
 
     async def get_patient(
