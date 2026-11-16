@@ -1,8 +1,9 @@
 "use client";
 
 import { useRef, useState } from "react";
-import { searchEpicClaims } from "@/lib/api";
-import type { EpicClaimSearch } from "@/lib/financial-models";
+import { Button } from "@/components/ui/button";
+import { searchPatientClaims } from "@/lib/api";
+import type { PatientClaimSearch } from "@/lib/financial-models";
 
 export default function EpicFinancialClaims({
   sessionId,
@@ -15,7 +16,7 @@ export default function EpicFinancialClaims({
 }) {
   const [pending, setPending] = useState(false);
   const [error, setError] = useState("");
-  const [result, setResult] = useState<EpicClaimSearch | null>(null);
+  const [result, setResult] = useState<PatientClaimSearch | null>(null);
   const locked = useRef(false);
 
   async function loadClaims() {
@@ -25,14 +26,16 @@ export default function EpicFinancialClaims({
     setError("");
     setResult(null);
     try {
-      const search = await searchEpicClaims(sessionId);
+      const search = await searchPatientClaims(sessionId);
       if (search.patientId !== patientId) {
-        throw new Error("Epic returned claims for a different patient context.");
+        throw new Error(
+          "The provider returned claims for a different patient context.",
+        );
       }
       setResult(search);
     } catch (reason) {
       setError(
-        reason instanceof Error ? reason.message : "Epic claim search failed.",
+        reason instanceof Error ? reason.message : "Patient claim search failed.",
       );
     } finally {
       locked.current = false;
@@ -52,15 +55,15 @@ export default function EpicFinancialClaims({
           Select a patient and authorize Clinical and Claims access to continue.
         </p>
       )}
-      <button disabled={!connected || pending} onClick={loadClaims}>
+      <Button disabled={!connected || pending} onClick={loadClaims}>
         {pending ? "Loading claims..." : "Load all patient claims"}
-      </button>
+      </Button>
       {pending && <p role="status">Request in progress.</p>}
       {error && <p role="alert">{error}</p>}
       {result && (
         <section aria-label="Epic claim search results">
           <p>
-            Source: Epic sandbox | Patient: {result.patientId} | All available
+            Source: {result.source} | Patient: {result.patientId} | All available
             dates | Pages: {result.pages} |{" "}
             {result.complete ? "Retrieval complete" : "Incomplete"}
           </p>

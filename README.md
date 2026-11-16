@@ -15,8 +15,8 @@ Epic sandbox and model settings configured, run:
 docker compose up --build
 ```
 
-Open **http://localhost:3000** after the services start. Select a sandbox
-patient and authorize Epic access in the chat. The API runs at
+Open **http://localhost:3000** after the services start. Search for a synthetic
+patient, select a result, and authorize the selected patient for chat. The API runs at
 http://localhost:8000; the CLI is optional and does not start with the web app.
 
 Use the same patient-scoped chat for Clinical and Financials questions.

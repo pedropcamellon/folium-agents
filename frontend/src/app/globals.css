@@ -1,3 +1,7 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
 :root {
   color-scheme: light;
   --ink: #17283b;
@@ -26,38 +30,16 @@ body {
   font-family: Arial, Helvetica, sans-serif;
 }
 
-button,
 input,
 textarea {
   font: inherit;
 }
 
-button {
-  min-height: 2.7rem;
-  border: 1px solid var(--blue);
-  border-radius: 4px;
-  padding: 0.65rem 1rem;
-  background: var(--blue);
-  color: #fff;
-  cursor: pointer;
-  font-weight: 700;
-}
-
-button:hover:not(:disabled) {
-  background: #0e558f;
-}
-
-button:focus-visible,
 input:focus-visible,
 textarea:focus-visible,
 a:focus-visible {
   outline: 3px solid var(--gold);
   outline-offset: 2px;
-}
-
-button:disabled {
-  cursor: not-allowed;
-  opacity: 0.55;
 }
 
 input,
@@ -435,19 +417,7 @@ h3 {
   background: var(--green);
 }
 
-.secondary {
-  border-color: #8b9aaa;
-  background: #fff;
-  color: #30455b;
-}
-
-.secondary:hover:not(:disabled) {
-  background: #edf2f6;
-}
-
 .end-session {
-  min-height: 2.3rem;
-  padding: 0.45rem 0.7rem;
   font-size: 0.78rem;
 }
 
@@ -483,51 +453,10 @@ h3 {
   text-align: right;
 }
 
-.patient-selector {
-  display: grid;
-  gap: 0.55rem;
-  margin: 0.9rem 0 1rem;
-}
-
-.patient-selector label {
-  font-size: 0.82rem;
-  font-weight: 700;
-}
-
-.patient-selector input {
-  min-width: 0;
-  font-size: 0.82rem;
-}
-
-.patient-selector button,
 .context-action {
   width: 100%;
-  margin-top: 0.35rem;
+  margin-top: 0.9rem;
   font-size: 0.78rem;
-}
-
-.patient-dialog {
-  width: min(92vw, 480px);
-  max-width: 480px;
-  padding: 0;
-  border: 1px solid var(--line);
-  border-radius: 6px;
-  color: var(--ink);
-}
-
-.patient-dialog::backdrop {
-  background: rgb(16 43 73 / 48%);
-}
-
-.patient-dialog .patient-selector {
-  margin: 0;
-  padding: 1.4rem;
-}
-
-.dialog-actions {
-  display: flex;
-  justify-content: flex-end;
-  gap: 0.65rem;
 }
 
 .context-action {

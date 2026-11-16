@@ -5,6 +5,14 @@ Epic is the first provider; the API discovers connectors through entry points
 so another EHR can implement the same contract without changing chat
 orchestration.
 
+The API loads only providers named by `FOLIUM_AGENTS_ENABLED_PROVIDERS`, a
+comma-separated list that defaults to `epic`. Set it to an empty value to start
+without loading any EHR integration. Provider implementations can expose
+patient-search and claims capabilities independently from chart chat.
+`GET /api/providers` and session status report supported operations and
+authorization state; these values describe availability, not permission to
+access patient data. Each operation still validates the active provider grant.
+
 Use synthetic Epic sandbox records only. The API performs SMART authorization
 with PKCE. Compose persists authorized connections in an encrypted SQLite
 database on a named volume, with a separate key volume. The browser stores only
@@ -42,7 +50,21 @@ web flow:
 http://localhost:8000/api/epic/callback
 ```
 
-The current Epic connector requests patient-scoped access to
+The patient-search view requests provider-level `user/Patient.rs` access
+through OAuth2. The target Epic app and clinician must have permission to use
+Patient.Search. Search requires given name, family name, and date of birth;
+the API sends FHIR `given`, `family`, and `birthdate` parameters without
+unverified matching modifiers. This matches Epic's documented default minimum
+data set. A name-only experiment returned a provider rejection; its exact
+cause remains unconfirmed because the original OperationOutcome code and
+severity were not captured. The name-only query is not the normal search path.
+An Epic organization may require additional demographics. An empty result
+does not prove that no matching patient exists. Search results are candidates,
+not an exhaustive patient list.
+
+After an explicit selection, the app starts the existing patient-scoped chat
+authorization flow. The provider search token is not reused for chart reads.
+The patient-scoped chat connector requests access to
 `MedicationRequest`, `AllergyIntolerance`, `Condition`, and read access to
 `Patient` for the selected patient's name and date of birth. These resource
 types are provisional until the configured Epic sandbox confirms the search
@@ -82,11 +104,11 @@ From the repository root, set the environment variables above and then:
 docker compose up --build
 ```
 
-Open `http://localhost:3000`. The root route opens directly to the chat
-workspace; select or change the synthetic Patient FHIR ID in the patient
-context panel. The app and API bind to loopback ports 3000 and 8000. Authorize
-the selected patient through the configured EHR connector. The OAuth redirect
-must be registered exactly as shown above. The API disables HTTP access
+Open `http://localhost:3000`. The root route opens to patient search. Authorize
+the provider-level Patient search access, then search with synthetic
+demographics. Select a result to enter the existing patient-scoped chat
+authorization flow. The app and API bind to loopback ports 3000 and 8000. The
+OAuth redirect must be registered exactly as shown above. The API disables HTTP access
 logging so the authorization code in the callback URL is not written to
 container logs. After authorization, the callback returns to the same root
 chat view with the patient context active.
@@ -134,16 +156,17 @@ before changing the patient ID or weakening the requested scopes:
 3. Configure authorization-code flow with PKCE S256. Set
    `EPIC_TOKEN_AUTH_METHOD=none` if the app is registered as a public client;
    otherwise configure the token authentication method required by that app.
-4. Ensure the app registration permits the requested scopes:
+4. Ensure the app registration permits provider-level Patient search
+   (`user/Patient.rs`) and the patient-scoped chat resources:
    `openid`, `fhirUser`, `launch/patient`,
    `patient/MedicationRequest.rs`,
    `patient/AllergyIntolerance.rs`, `patient/Condition.rs`, and
    `patient/Patient.r`.
 5. Save the registration, make `.env` match it, and recreate Compose so the API
    uses the updated settings.
-6. Retry from `http://localhost:3000` with a known synthetic ID from the
-   [Epic sandbox test-patient list](https://fhir.epic.com/Documentation?docId=testpatients).
-   Confirm the callback returns to the chat with that same patient context.
+6. Retry from `http://localhost:3000` using synthetic patient demographics.
+   Confirm Patient.Search returns candidates, explicitly select one, and
+   complete the patient-scoped chat authorization for that same result.
 
 Do not remove resource scopes just to bypass the authorization error; the chat
 needs those grants to retrieve evidence. If the registration does not support a
@@ -210,6 +233,8 @@ excluded from routine diagnostic events.
 Logs never include raw exception messages, request bodies, patient identifiers,
 chart content, access/refresh tokens, codes or authorization URLs. HTTP access
 logs remain disabled and provider HTTP client logging is restricted to warnings.
+For Patient.Search OperationOutcome rejections, logs include only allowlisted
+FHIR issue codes and severity values; provider diagnostic text is not logged.
 Keep that policy in any reverse proxy too; callback query strings and session
 paths contain secrets. An OAuth error rendered on Epic's own page occurs before
 our callback and cannot be diagnosed from our response reference: verify the app

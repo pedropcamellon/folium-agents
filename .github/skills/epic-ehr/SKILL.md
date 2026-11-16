@@ -1,5 +1,5 @@
 ---
-name: epic
+name: epic-ehr
 description: Build, debug, and validate Folium Agents integrations with Epic SMART on FHIR. Use for Epic authorization, scopes, patient context, Clinical reads, ExplanationOfBenefit claims, OperationOutcome warnings, sandbox fixtures, and live integration proof.
 ---
 

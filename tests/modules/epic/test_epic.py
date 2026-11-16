@@ -1,6 +1,7 @@
 import asyncio
 import time
 from pathlib import Path
+from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 import httpx
@@ -9,6 +10,7 @@ from pydantic import ValidationError
 
 from folium_agents.epic.epic import (
     EpicConfig,
+    EpicPatientSearchRejected,
     EpicSmartClient,
     EpicTokenCache,
 )
@@ -19,7 +21,7 @@ from folium_agents.epic.models import (
 )
 
 
-def _epic_config(**values: object) -> EpicConfig:
+def _epic_config(**values: Any) -> EpicConfig:
     return EpicConfig(_env_file=None, **values)
 
 
@@ -54,6 +56,7 @@ def test_epic_settings_require_client_id_and_redirect_uri(
 def test_epic_settings_load_repository_root_env_file() -> None:
     env_file = EpicConfig.model_config["env_file"]
 
+    assert isinstance(env_file, (str, Path))
     assert Path(env_file).resolve() == Path(__file__).resolve().parents[3] / ".env"
 
 
@@ -90,11 +93,12 @@ def test_build_authorization_url_includes_state_pkce_and_launch_context() -> Non
 
 
 def test_exchange_code_rejects_state_mismatch_before_request() -> None:
+    def unexpected_request(_request: httpx.Request) -> httpx.Response:
+        raise AssertionError("State mismatch must not send a request.")
+
     async def run_test() -> None:
         async with httpx.AsyncClient(
-            transport=httpx.MockTransport(
-                lambda request: pytest.fail("state mismatch must not send a request")
-            )
+            transport=httpx.MockTransport(unexpected_request)
         ) as http_client:
             client = EpicSmartClient(
                 _epic_config(
@@ -266,7 +270,7 @@ def test_disabled_epic_token_cache_does_not_access_keyring(
     from folium_agents.epic import epic
 
     def unexpected_keyring_access(*args: object) -> None:
-        pytest.fail("A disabled token cache must not access the OS keyring.")
+        raise AssertionError("A disabled token cache must not access the OS keyring.")
 
     monkeypatch.setattr(epic.keyring, "get_password", unexpected_keyring_access)
     monkeypatch.setattr(epic.keyring, "set_password", unexpected_keyring_access)
@@ -440,6 +444,7 @@ def test_search_patients_requests_bounded_minimal_patient_data() -> None:
             200,
             json={
                 "resourceType": "Bundle",
+                "type": "searchset",
                 "total": 42,
                 "entry": [
                     {
@@ -479,6 +484,211 @@ def test_search_patients_requests_bounded_minimal_patient_data() -> None:
             "https://epic.example.test/api/FHIR/R4/Patient?_id=sample-001"
         )
         assert requests[0].headers["Authorization"] == "Bearer synthetic-token"
+
+    asyncio.run(run_test())
+
+
+def test_search_patients_uses_given_family_and_birthdate_without_fhir_id() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "resourceType": "Bundle",
+                "type": "searchset",
+                "total": 1,
+                "entry": [
+                    {
+                        "resource": {
+                            "resourceType": "Patient",
+                            "id": "sample-001",
+                            "name": [{"given": ["Alex"], "family": "Sample"}],
+                            "birthDate": "1980-01-01",
+                        }
+                    }
+                ],
+            },
+        )
+
+    async def run_test() -> None:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            epic = EpicSmartClient(
+                _epic_config(
+                    client_id="sandbox-client",
+                    redirect_uri="http://localhost:8765/callback",
+                    issuer="https://epic.example.test/api/FHIR/R4",
+                ),
+                http_client=client,
+            )
+            result = await epic.search_patients(
+                "synthetic-token",
+                given_name="Alex",
+                family_name="Sam",
+                birthdate="1980-01-01",
+            )
+
+        assert result.total == 1
+        assert result.more_matches_available is False
+        assert [patient.id for patient in result.patients] == ["sample-001"]
+        assert len(requests) == 1
+        assert requests[0].url.params["given"] == "Alex"
+        assert requests[0].url.params["family"] == "Sam"
+        assert requests[0].url.params["birthdate"] == "1980-01-01"
+        assert requests[0].url.params["_count"] == "100"
+        assert "_id" not in requests[0].url.params
+        assert "given:contains" not in requests[0].url.params
+        assert "family:contains" not in requests[0].url.params
+        assert "name" not in requests[0].url.params
+        assert requests[0].headers["Authorization"] == "Bearer synthetic-token"
+
+    asyncio.run(run_test())
+
+
+@pytest.mark.parametrize(
+    ("given_name", "family_name", "birthdate"),
+    [
+        (None, "Sam", "1980-01-01"),
+        ("Alex", None, "1980-01-01"),
+        ("Alex", "Sam", None),
+        (" ", "Sam", "1980-01-01"),
+        ("Alex", " ", "1980-01-01"),
+        ("Alex", "Sam", "1980-02-31"),
+        ("Alex", "Sam", "1980/01/01"),
+    ],
+)
+def test_search_patients_rejects_missing_or_invalid_demographics(
+    given_name: str | None,
+    family_name: str | None,
+    birthdate: str | None,
+) -> None:
+    def reject_request(_request: httpx.Request) -> httpx.Response:
+        raise AssertionError("Invalid search criteria must not call Epic.")
+
+    async def run_test() -> None:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(reject_request)
+        ) as client:
+            epic = EpicSmartClient(
+                _epic_config(
+                    client_id="sandbox-client",
+                    redirect_uri="http://localhost:8765/callback",
+                ),
+                http_client=client,
+            )
+            with pytest.raises(ValueError):
+                await epic.search_patients(
+                    "synthetic-token",
+                    given_name=given_name,
+                    family_name=family_name,
+                    birthdate=birthdate,
+                )
+
+    asyncio.run(run_test())
+
+
+def test_search_patients_marks_truncated_results_as_incomplete() -> None:
+    async def run_test() -> None:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(
+                lambda _request: httpx.Response(
+                    200,
+                    json={
+                        "resourceType": "Bundle",
+                        "type": "searchset",
+                        "total": 101,
+                        "link": [
+                            {
+                                "relation": "next",
+                                "url": (
+                                    "https://epic.example.test/api/FHIR/R4/Patient"
+                                    "?page=2"
+                                ),
+                            }
+                        ],
+                        "entry": [
+                            {
+                                "resource": {
+                                    "resourceType": "Patient",
+                                    "id": "sample-001",
+                                    "name": [],
+                                }
+                            }
+                        ],
+                    },
+                )
+            )
+        ) as client:
+            epic = EpicSmartClient(
+                _epic_config(
+                    client_id="sandbox-client",
+                    redirect_uri="http://localhost:8765/callback",
+                ),
+                http_client=client,
+            )
+            result = await epic.search_patients(
+                "synthetic-token",
+                given_name="Sample",
+                family_name="Patient",
+                birthdate="1980-01-01",
+            )
+
+        assert result.more_matches_available is True
+        assert len(result.patients) == 1
+
+    asyncio.run(run_test())
+
+
+@pytest.mark.parametrize("as_bundle_entry", [False, True])
+@pytest.mark.parametrize("severity", ["error", "warning"])
+def test_search_patients_classifies_epic_operation_outcome(
+    as_bundle_entry: bool,
+    severity: str,
+) -> None:
+    outcome = {
+        "resourceType": "OperationOutcome",
+        "issue": [
+            {
+                "severity": severity,
+                "code": "required",
+                "diagnostics": "More demographics are required.",
+            }
+        ],
+    }
+    payload = (
+        {
+            "resourceType": "Bundle",
+            "type": "searchset",
+            "total": 0,
+            "entry": [{"resource": outcome}],
+        }
+        if as_bundle_entry
+        else outcome
+    )
+
+    async def run_test() -> None:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(
+                lambda _request: httpx.Response(200, json=payload)
+            )
+        ) as client:
+            epic = EpicSmartClient(
+                _epic_config(
+                    client_id="sandbox-client",
+                    redirect_uri="http://localhost:8765/callback",
+                ),
+                http_client=client,
+            )
+            with pytest.raises(EpicPatientSearchRejected) as error:
+                await epic.search_patients(
+                    "synthetic-token",
+                    given_name="Sample",
+                    family_name="Patient",
+                    birthdate="1980-01-01",
+                )
+            assert error.value.provider_issue_codes == ("required",)
+            assert error.value.provider_issue_severities == (severity,)
 
     asyncio.run(run_test())
 
@@ -1073,7 +1283,9 @@ def test_medication_review_cli_uses_patient_context_and_displays_chart_evidence(
     assert observed["scope"] == MEDICATION_REVIEW_SCOPE
     assert observed["cache_context"] == "sample-001"
     assert observed["review"] == ("synthetic-access-token", "sample-001")
-    assert observed["saved_token"].patient == "sample-001"
+    saved_token = observed["saved_token"]
+    assert isinstance(saved_token, EpicToken)
+    assert saved_token.patient == "sample-001"
     assert "Recorded allergy" in output
     assert "Recorded condition" in output
     assert "Possible duplicate medication entries" in output
@@ -1103,7 +1315,7 @@ def test_medication_review_cli_rejects_wrong_authorized_patient_context(
         code_challenge_methods_supported=["S256"],
     )
 
-    class FakeEpicClient:
+    class FakeEpicClient(epic_cli._MedicationReviewClient):
         @staticmethod
         def create_state() -> str:
             return "synthetic-state"
@@ -1114,7 +1326,7 @@ def test_medication_review_cli_rejects_wrong_authorized_patient_context(
 
         @staticmethod
         def build_authorization_url(
-            discovered: SmartConfiguration,
+            smart: SmartConfiguration,
             *,
             state: str,
             code_challenge: str,
@@ -1123,13 +1335,24 @@ def test_medication_review_cli_rejects_wrong_authorized_patient_context(
 
         async def exchange_code(
             self,
-            discovered: SmartConfiguration,
-            **kwargs: str,
+            smart: SmartConfiguration,
+            *,
+            code: str,
+            returned_state: str,
+            expected_state: str,
+            code_verifier: str,
         ) -> EpicToken:
             return EpicToken(
                 access_token="synthetic-access-token",
                 patient="different-patient",
             )
+
+        async def refresh_access_token(
+            self,
+            smart: SmartConfiguration,
+            refresh_token: str,
+        ) -> EpicToken:
+            raise AssertionError("No cached token should need refresh.")
 
     class FakeTokenCache:
         def __init__(self) -> None:
@@ -1139,7 +1362,7 @@ def test_medication_review_cli_rejects_wrong_authorized_patient_context(
             return None
 
         def save(self, token: EpicToken) -> None:
-            pytest.fail("A mismatched patient token must not be cached.")
+            raise AssertionError("A mismatched patient token must not be cached.")
 
         def clear(self) -> None:
             self.cleared = True
@@ -1269,7 +1492,9 @@ def test_patient_cli_orchestrates_auth_and_displays_only_patient_summary(
     assert "Alex Sample" in output
     assert "synthetic-access-token" not in output
     assert observed["search"] == ("synthetic-access-token", "sample-001")
-    assert observed["cached_token"].access_token == "synthetic-access-token"
+    cached_token = observed["cached_token"]
+    assert isinstance(cached_token, EpicToken)
+    assert cached_token.access_token == "synthetic-access-token"
     assert observed["exchange"] == {
         "code": "synthetic-code",
         "returned_state": "synthetic-state",
@@ -1336,10 +1561,10 @@ def test_patient_cli_reuses_unexpired_cached_access_token(
             return cached
 
         def save(self, token: EpicToken) -> None:
-            pytest.fail("A valid cached token should not be rewritten.")
+            raise AssertionError("A valid cached token should not be rewritten.")
 
         def clear(self) -> None:
-            pytest.fail("A valid cached token should not be cleared.")
+            raise AssertionError("A valid cached token should not be cleared.")
 
     monkeypatch.setattr(epic_cli.EpicConfig, "from_environment", lambda: config)
     monkeypatch.setattr(epic_cli, "EpicSmartClient", lambda settings: FakeEpicClient())
@@ -1347,7 +1572,9 @@ def test_patient_cli_reuses_unexpired_cached_access_token(
     monkeypatch.setattr(
         epic_cli,
         "_authorize_epic",
-        lambda *args: pytest.fail("A valid cached token should skip browser login."),
+        lambda *args: (_ for _ in ()).throw(
+            AssertionError("A valid cached token should skip browser login.")
+        ),
     )
     console = Console(record=True, width=100)
 
@@ -1404,6 +1631,7 @@ def test_top_level_cli_runs_epic_oauth_and_patient_search_end_to_end(
                 200,
                 json={
                     "resourceType": "Bundle",
+                    "type": "searchset",
                     "total": 1,
                     "entry": [
                         {
@@ -1421,7 +1649,7 @@ def test_top_level_cli_runs_epic_oauth_and_patient_search_end_to_end(
                     ],
                 },
             )
-        pytest.fail(f"Unexpected API request: {request.method} {request.url}")
+        raise AssertionError(f"Unexpected API request: {request.method} {request.url}")
 
     http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     api_client = EpicSmartClient(config, http_client=http_client)

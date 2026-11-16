@@ -45,3 +45,24 @@ def test_unknown_failure_text_is_not_logged(
     assert "failure_code" not in fields
     assert fields["error_type"] == "ValueError"
     assert sensitive_text not in caplog.text
+
+
+def test_provider_issue_details_are_allowlisted_and_text_is_not_logged(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    class ProviderFailure(ValueError):
+        provider_issue_codes = ("required", "patient-specific-detail")
+        provider_issue_severities = ("error", "patient-specific-detail")
+
+    provider_text = "More demographics are required for synthetic patient."
+    error = ValueError("Safe patient search rejection.")
+    error.__cause__ = ProviderFailure(provider_text)
+
+    with caplog.at_level(logging.WARNING, logger="uvicorn.error"):
+        diagnostic("fhir.patient_search_rejected", error=error)
+
+    fields = json.loads(caplog.records[-1].message)
+    assert fields["provider_issue_codes"] == ["required"]
+    assert fields["provider_issue_severities"] == ["error"]
+    assert provider_text not in caplog.text
+    assert "patient-specific-detail" not in caplog.text

@@ -2,8 +2,8 @@
 
 The Epic adapter is the first implementation of the provider-neutral EHR
 connector contract. It uses SMART on FHIR for read-only synthetic sandbox
-access. Patient lookup requires an explicit FHIR ID; it does not enumerate
-patients.
+access. The CLI's direct Patient lookup uses an explicit FHIR ID. The web
+search uses demographics and returns candidates, not an exhaustive roster.
 
 ## Configure
 
@@ -44,9 +44,9 @@ uv run folium-agents epic patients --patient-id <FHIR_ID>
 `epic discover` also reads the FHIR CapabilityStatement at `<FHIR base>/metadata`
 to show available resource interactions and Patient search parameters. Epic's
 CapabilityStatement is server-wide and does not grant those interactions to the
-app; the app registration and token scopes still control access. The sandbox
-rejects unfiltered Patient searches and `_elements`; use a Patient FHIR
-ID from its [test patient documentation](https://fhir.epic.com/Documentation?docId=testpatients).
+app; the app registration and token scopes still control access. The CLI
+patient command uses a Patient FHIR ID from its
+[test patient documentation](https://fhir.epic.com/Documentation?docId=testpatients).
 The patient command authorizes through the browser, verifies OAuth state and
 PKCE, then searches by that ID. The response may contain the full Patient
 resource, but the CLI displays only its ID and name. OAuth tokens are cached
@@ -56,18 +56,37 @@ The sandbox contains synthetic test data. This does not authorize access to
 production systems; each Epic customer controls and approves its own
 connection.
 
-## Patient Scope authorization
+## Patient search and scope authorization
 
-Select **Set patient** and enter a known Patient FHIR ID in the dialog. One
-SMART PKCE authorization requests the explicit read/search resources used by
-the current Clinical and Claims features. The request includes the clinical
+The web app starts with a provider-level OAuth2 grant for demographic
+Patient.Search (`user/Patient.rs`). Search uses given name, family name, and
+date of birth (`YYYY-MM-DD`), sent as the FHIR `given`, `family`, and
+`birthdate` parameters without matching modifiers. This matches Epic's
+documented default minimum data set; organizations can require additional
+demographics. A name-only experiment returned a provider rejection, but the
+exact cause remains unconfirmed because the original OperationOutcome code and
+severity were not captured. Search results require explicit patient
+selection. If a search returns no matches, check the details or access; do not
+conclude that no patient exists. This search is not a complete patient roster.
+An Epic error or warning OperationOutcome is reported as a rejected search
+with guidance to verify configured requirements or Patient.Search app access;
+provider diagnostic text is not logged. Rejected OperationOutcomes include
+only allowlisted FHIR issue codes and severity values in the API logs.
+
+After selection, the app starts the existing patient-scoped SMART PKCE
+authorization for Clinical and Claims. The provider search token is not reused
+for patient chart reads. The patient grant includes the clinical
 patient-context scopes and `user/ExplanationOfBenefit.rs`; it does not request
-wildcard access. One chat handles Clinical and Financials questions using that
-patient-bound connection. The model can select chart reads or patient claim
-search without a separate tab or Investigate action. Changing the patient
-clears the conversation and starts a new authorization context. Use the
-same hostname for the app and registered callback (for example, `localhost`)
-so the browser can return the session.
+wildcard access. Each patient chat remains bound to its selected patient.
+Changing patients clears the conversation and starts a new patient
+authorization context. Use the same hostname for the app and registered
+callback (for example, `localhost`) so the browser can return the session.
+
+Epic's documented search behavior does not prove that the configured app and
+clinician have the required provider-level security. Verify the app
+registration, user type, organization-specific minimum data set, and live
+synthetic search separately. CapabilityStatement metadata and offline tests
+are not proof of authorization.
 
 The Epic app must enable the required MedicationRequest, AllergyIntolerance,
 Condition, Patient, and ExplanationOfBenefit interactions for the relevant

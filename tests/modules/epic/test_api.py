@@ -14,13 +14,14 @@ from folium_agents.core.ehr import (
     AuthorizationRequest,
     ChartEvidence,
     EHRConnectionStatus,
+    EHRConnector,
+    EHRProvider,
     EvidenceRecord,
+    PatientClaimsConnector,
     PatientDemographics,
 )
-from folium_agents.epic.adapter import EpicConnector
+from folium_agents.core.financial import ClaimEvidence, ClaimSearch
 from folium_agents.epic.financial_reads import (
-    ClaimEvidence,
-    ClaimSearch,
     FinancialReadError,
 )
 
@@ -70,7 +71,7 @@ def _mock_openai(
 def test_chat_selects_patient_claims_without_reading_clinical_chart(
     monkeypatch: pytest.MonkeyPatch, result_kind: str
 ) -> None:
-    connector = EpicConnector()
+    connector = FakeConnector(connected=True)
     patient_id = "synthetic-patient"
     session_id = "synthetic-financial-chat"
     called: list[str] = []
@@ -79,12 +80,14 @@ def test_chat_selects_patient_claims_without_reading_clinical_chart(
         assert patient == patient_id
         return EHRConnectionStatus(connected=True, patient_id=patient_id)
 
-    async def claims(selected_session: str) -> ClaimSearch:
+    async def claims(selected_session: str, selected_patient: str) -> ClaimSearch:
         assert selected_session == session_id
+        assert selected_patient == patient_id
         called.append("claims")
         if result_kind == "missing-scope":
             raise FinancialReadError("Epic authorization is missing EOB permissions.")
         return ClaimSearch(
+            source="synthetic-provider",
             patient_id=patient_id,
             claims=[
                 ClaimEvidence(
@@ -102,18 +105,36 @@ def test_chat_selects_patient_claims_without_reading_clinical_chart(
             limitations=["EOB adjudication is not internal posting status."],
         )
 
+    class FakeClaimsConnector(PatientClaimsConnector):
+        async def search_patient_claims(
+            self,
+            session_id: str,
+            patient_id: str,
+        ) -> ClaimSearch:
+            return await claims(session_id, patient_id)
+
     async def chart(_session: str, _patient: str) -> ChartEvidence:
         raise AssertionError("A financial question must not force a Clinical read.")
 
     monkeypatch.setattr(connector, "get_connection_status", status)
-    monkeypatch.setattr(connector, "search_patient_claims", claims)
     monkeypatch.setattr(connector, "retrieve_patient_chart", chart)
-    monkeypatch.setattr(api, "connectors", {"epic": connector})
+    monkeypatch.setattr(
+        api,
+        "connectors",
+        {
+            "fake": EHRProvider(
+                provider_id="fake",
+                connector=connector,
+                patient_search=None,
+                claims=FakeClaimsConnector(),
+            )
+        },
+    )
     monkeypatch.setattr(api.settings, "model_name", "synthetic-model")
     monkeypatch.setattr(api.settings, "model_api_key", "synthetic-key")
     monkeypatch.setattr(api.settings, "model_base_url", "https://model.example.test/v1")
     api.sessions[session_id] = api_models.ChatSessionState(
-        patient_id=patient_id, provider_id="epic", authorization_state=""
+        patient_id=patient_id, provider_id="fake", authorization_state=""
     )
     requests: list[dict[str, Any]] = []
     _mock_openai(
@@ -191,6 +212,7 @@ def test_chat_selects_patient_claims_without_reading_clinical_chart(
 @pytest.fixture(autouse=True)
 def clear_sessions(monkeypatch: pytest.MonkeyPatch) -> None:
     api.sessions.clear()
+    api.patient_search_sessions.clear()
     monkeypatch.setattr(api, "store", None)
     monkeypatch.setattr(api.settings, "log_model_responses", False)
     monkeypatch.setattr(api.settings, "require_model_citations", True)
@@ -310,7 +332,7 @@ def test_api_rejects_private_network_preflight_from_untrusted_origin() -> None:
     assert "Disallowed CORS origin" in response.text
 
 
-class FakeConnector:
+class FakeConnector(EHRConnector):
     name = "fake"
 
     def __init__(self, *, connected: bool = False) -> None:
@@ -342,7 +364,7 @@ class FakeConnector:
 
     async def get_connection_status(
         self,
-        _session_id: str,
+        session_id: str,
         patient_id: str,
     ) -> EHRConnectionStatus:
         return EHRConnectionStatus(
@@ -352,7 +374,7 @@ class FakeConnector:
 
     async def get_patient_demographics(
         self,
-        _session_id: str,
+        session_id: str,
         patient_id: str,
     ) -> PatientDemographics:
         return PatientDemographics(
@@ -364,7 +386,7 @@ class FakeConnector:
 
     async def retrieve_patient_chart(
         self,
-        _session_id: str,
+        session_id: str,
         patient_id: str,
     ) -> ChartEvidence:
         return ChartEvidence(patient_id, [], [], True)
@@ -381,7 +403,7 @@ def test_chat_api_returns_answer_and_sources_separately(
     # Arrange: supply an authorized chart and a predictable, sourced model answer.
     class ChartConnector(FakeConnector):
         async def retrieve_patient_chart(
-            self, _session_id: str, patient_id: str
+            self, session_id: str, patient_id: str
         ) -> ChartEvidence:
             return ChartEvidence(
                 patient_id,
@@ -399,7 +421,18 @@ def test_chat_api_returns_answer_and_sources_separately(
                 False,
             )
 
-    monkeypatch.setattr(api, "connectors", {"fake": ChartConnector(connected=True)})
+    monkeypatch.setattr(
+        api,
+        "connectors",
+        {
+            "fake": EHRProvider(
+                provider_id="fake",
+                connector=ChartConnector(connected=True),
+                patient_search=None,
+                claims=None,
+            )
+        },
+    )
     storage = Mock()
     storage.load.return_value = None
     monkeypatch.setattr(api, "store", storage)
@@ -477,7 +510,11 @@ def test_create_session_uses_registered_provider_neutrally(
     """Let users connect through their selected EHR without changing the chat flow."""
     # Arrange: make a supported EHR available.
     fake = FakeConnector()
-    monkeypatch.setattr(api, "connectors", {"fake": fake})
+    monkeypatch.setattr(
+        api,
+        "connectors",
+        {"fake": EHRProvider("fake", fake, None, None)},
+    )
 
     # Act: request a new connection for the selected patient.
     response = TestClient(api.app).post(
@@ -500,7 +537,11 @@ def test_authorization_callback_delegates_to_selected_connector(
     """Return users to their workspace after their selected EHR grants access."""
     # Arrange: start an authorization request for the selected EHR.
     fake = FakeConnector()
-    monkeypatch.setattr(api, "connectors", {"fake": fake})
+    monkeypatch.setattr(
+        api,
+        "connectors",
+        {"fake": EHRProvider("fake", fake, None, None)},
+    )
     session_id = "session-for-test"
     api.sessions[session_id] = api_models.ChatSessionState(
         patient_id="synthetic-patient",
@@ -537,7 +578,11 @@ def test_patient_profile_uses_connected_patient_context(
     """Show details for the authorized patient rather than a different patient."""
     # Arrange: connect a session to a known synthetic patient.
     fake = FakeConnector(connected=True)
-    monkeypatch.setattr(api, "connectors", {"fake": fake})
+    monkeypatch.setattr(
+        api,
+        "connectors",
+        {"fake": EHRProvider("fake", fake, None, None)},
+    )
     session_id = "session-with-patient-context"
     api.sessions[session_id] = api_models.ChatSessionState(
         patient_id="synthetic-patient",
@@ -564,7 +609,11 @@ def test_patient_profile_is_not_loaded_before_ehr_authorization(
     """Keep patient details private until the EHR grants access."""
     # Arrange: select a patient without granting access.
     fake = FakeConnector(connected=False)
-    monkeypatch.setattr(api, "connectors", {"fake": fake})
+    monkeypatch.setattr(
+        api,
+        "connectors",
+        {"fake": EHRProvider("fake", fake, None, None)},
+    )
     session_id = "session-without-authorization"
     api.sessions[session_id] = api_models.ChatSessionState(
         patient_id="synthetic-patient",
@@ -586,7 +635,11 @@ def test_reset_ends_connector_and_removes_in_memory_session(
     """End the patient's connection when the user ends the session."""
     # Arrange: create an active patient connection.
     fake = FakeConnector(connected=True)
-    monkeypatch.setattr(api, "connectors", {"fake": fake})
+    monkeypatch.setattr(
+        api,
+        "connectors",
+        {"fake": EHRProvider("fake", fake, None, None)},
+    )
     session_id = "session-to-reset"
     api.sessions[session_id] = api_models.ChatSessionState(
         patient_id="synthetic-patient",
@@ -610,7 +663,11 @@ def test_chat_hides_model_configuration_details_from_user(
     """Give users a safe failure message while keeping useful operator diagnostics."""
     # Arrange: simulate a missing model credential on an authorized connection.
     fake = FakeConnector(connected=True)
-    monkeypatch.setattr(api, "connectors", {"fake": fake})
+    monkeypatch.setattr(
+        api,
+        "connectors",
+        {"fake": EHRProvider("fake", fake, None, None)},
+    )
     monkeypatch.setattr(api.settings, "model_api_key", "")
     monkeypatch.setattr(api.settings, "model_name", "synthetic-model")
     monkeypatch.setattr(api.settings, "model_base_url", "https://model.example.test/v1")

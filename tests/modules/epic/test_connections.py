@@ -15,9 +15,26 @@ from openai import APIConnectionError
 from folium_agents.api import app as api
 from folium_agents.api.models import ChatMessage
 from folium_agents.core.connections import ConnectionStore
+from folium_agents.core.ehr import (
+    AuthorizationRequest,
+    EHRProvider,
+    PatientSearchCandidate,
+    PatientSearchCriteria,
+    PatientSearchResult,
+)
 from folium_agents.epic.adapter import EpicConnector
-from folium_agents.epic.epic import MEDICATION_REVIEW_SCOPE, EpicConfig, EpicSmartClient
-from folium_agents.epic.models import EpicToken, SmartConfiguration
+from folium_agents.epic.epic import (
+    MEDICATION_REVIEW_SCOPE,
+    EpicConfig,
+    EpicPatientSearchRejected,
+    EpicSmartClient,
+)
+from folium_agents.epic.models import (
+    EpicPatient,
+    EpicPatientSearchResult,
+    EpicToken,
+    SmartConfiguration,
+)
 
 
 @pytest.fixture
@@ -29,6 +46,7 @@ def persistent_connections(monkeypatch: pytest.MonkeyPatch):
     store = ConnectionStore(directory / "state.sqlite3", directory / "key")
     monkeypatch.setattr(api, "store", store)
     monkeypatch.setattr(api, "sessions", {})
+    monkeypatch.setattr(api, "patient_search_sessions", {})
     config = EpicConfig(
         _env_file=None,
         client_id="synthetic-client",
@@ -59,13 +77,22 @@ def persistent_connections(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(EpicSmartClient, "discover", discover)
     monkeypatch.setattr(EpicSmartClient, "exchange_code", exchange)
     connector = EpicConnector()
-    monkeypatch.setattr(api, "connectors", {"epic": connector})
+    monkeypatch.setattr(api, "connectors", {"epic": _epic_provider(connector)})
     try:
         yield directory, store, connector
     finally:
         shutil.rmtree(directory)
         if directory.parent.exists() and not any(directory.parent.iterdir()):
             directory.parent.rmdir()
+
+
+def _epic_provider(connector: EpicConnector) -> EHRProvider:
+    return EHRProvider(
+        provider_id="epic",
+        connector=connector,
+        patient_search=connector,
+        claims=connector,
+    )
 
 
 def authorize(client: TestClient, patient: str) -> str:
@@ -97,6 +124,282 @@ def test_patient_authorization_requests_combined_explicit_scopes(
     assert "patient/MedicationRequest.rs" in scopes
     assert "user/ExplanationOfBenefit.rs" in scopes
     assert not any(scope.startswith("system/") for scope in scopes)
+
+
+def test_provider_patient_search_authorization_and_selection_flow(
+    persistent_connections,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = TestClient(api.app)
+    created = client.post("/api/patient-search/sessions")
+    assert created.status_code == 200
+    session_id = created.json()["sessionId"]
+    authorization_url = created.json()["authorizationUrl"]
+    query = parse_qs(urlparse(authorization_url).query)
+    assert query["scope"] == ["openid fhirUser user/Patient.rs"]
+    assert "launch" not in query
+
+    state = api.patient_search_sessions[session_id].authorization_state
+
+    async def exchange(_self, _smart, **_kwargs):
+        return EpicToken(
+            access_token="synthetic-provider-token",
+            expires_in=3600,
+            patient=None,
+            scope="openid fhirUser user/Patient.rs",
+        )
+
+    calls: list[tuple[str, str, str, str]] = []
+
+    async def search(
+        _self,
+        access_token: str,
+        *,
+        patient_id: str | None = None,
+        given_name: str | None = None,
+        family_name: str | None = None,
+        birthdate: str | None = None,
+        issuer: str | None = None,
+    ) -> EpicPatientSearchResult:
+        assert access_token == "synthetic-provider-token"
+        assert issuer is None
+        assert patient_id is None
+        calls.append(
+            (access_token, given_name or "", family_name or "", birthdate or "")
+        )
+        return EpicPatientSearchResult(
+            total=1,
+            patients=[
+                EpicPatient(
+                    resourceType="Patient",
+                    id="synthetic-patient-a",
+                    name=[{"given": ["Alex"], "family": "Sample"}],
+                    birthDate="1980-01-01",
+                )
+            ],
+        )
+
+    monkeypatch.setattr(EpicSmartClient, "exchange_code", exchange)
+    monkeypatch.setattr(EpicSmartClient, "search_patients", search)
+    callback = client.get(
+        "/api/epic/callback",
+        params={"state": state, "code": "provider-code"},
+        follow_redirects=False,
+    )
+    assert callback.status_code == 307
+    assert "patient_search_session_id=" in callback.headers["location"]
+
+    response = client.post(
+        f"/api/patient-search/sessions/{session_id}/search",
+        json={
+            "givenName": "Alex",
+            "familyName": "Sam",
+            "birthDate": "1980-01-01",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "candidates": [
+            {
+                "patientId": "synthetic-patient-a",
+                "givenName": "Alex",
+                "familyName": "Sample",
+                "birthDate": "1980-01-01",
+            }
+        ],
+        "total": 1,
+        "moreMatchesAvailable": False,
+    }
+    assert calls == [("synthetic-provider-token", "Alex", "Sam", "1980-01-01")]
+
+
+def test_patient_search_routes_use_the_provider_capability_contract(
+    persistent_connections,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakePatientSearchProvider:
+        name = "synthetic"
+
+        async def start_patient_search_authorization(
+            self, session_id: str
+        ) -> AuthorizationRequest:
+            assert session_id
+            return AuthorizationRequest(
+                state="synthetic-state",
+                authorization_url="https://provider.example.test/authorize",
+            )
+
+        async def complete_patient_search_authorization(
+            self, session_id: str, *, state: str, code: str
+        ) -> None:
+            assert session_id
+            assert state == "synthetic-state"
+            assert code == "synthetic-code"
+
+        async def search_patient_candidates(
+            self, session_id: str, criteria: PatientSearchCriteria
+        ) -> PatientSearchResult:
+            assert session_id
+            assert criteria == PatientSearchCriteria(
+                given_name="Alex",
+                family_name="Sample",
+                birth_date="1980-01-01",
+            )
+            return PatientSearchResult(
+                candidates=[
+                    PatientSearchCandidate(
+                        patient_id="synthetic-patient",
+                        given_name="Alex",
+                        family_name="Sample",
+                        birth_date="1980-01-01",
+                    )
+                ],
+                total=1,
+                more_matches_available=False,
+            )
+
+        def end_patient_search_session(self, session_id: str) -> None:
+            return None
+
+    search_provider = FakePatientSearchProvider()
+    monkeypatch.setattr(
+        api,
+        "connectors",
+        {
+            "synthetic": EHRProvider(
+                provider_id="synthetic",
+                connector=None,
+                patient_search=search_provider,
+                claims=None,
+            )
+        },
+    )
+    monkeypatch.setattr(api.settings, "patient_search_provider", "synthetic")
+    client = TestClient(api.app)
+    created = client.post("/api/patient-search/sessions")
+    assert created.status_code == 200
+    session_id = created.json()["sessionId"]
+
+    callback = client.get(
+        "/api/synthetic/callback",
+        params={"state": "synthetic-state", "code": "synthetic-code"},
+        follow_redirects=False,
+    )
+    assert callback.status_code == 307
+
+    response = client.post(
+        f"/api/patient-search/sessions/{session_id}/search",
+        json={
+            "givenName": "Alex",
+            "familyName": "Sample",
+            "birthDate": "1980-01-01",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["candidates"][0]["patientId"] == "synthetic-patient"
+    ended = client.delete(f"/api/patient-search/sessions/{session_id}")
+    assert ended.status_code == 204
+
+
+def test_patient_search_requires_demographic_input(
+    persistent_connections,
+) -> None:
+    session_id = "synthetic-search-session"
+    api.patient_search_sessions[session_id] = api.PatientSearchSessionState(
+        provider_id="epic",
+        authorization_state="",
+    )
+    response = TestClient(api.app).post(
+        f"/api/patient-search/sessions/{session_id}/search",
+        json={
+            "givenName": " ",
+            "familyName": "Sample",
+            "birthDate": "1980-01-01",
+        },
+    )
+
+    assert response.status_code == 422
+
+
+def test_patient_search_maps_epic_outcome_to_demographic_guidance(
+    persistent_connections,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    client = TestClient(api.app)
+    created = client.post("/api/patient-search/sessions")
+    session_id = created.json()["sessionId"]
+    state = api.patient_search_sessions[session_id].authorization_state
+
+    async def exchange(_self, _smart, **_kwargs):
+        return EpicToken(
+            access_token="synthetic-provider-token",
+            expires_in=3600,
+            patient=None,
+            scope="openid fhirUser user/Patient.rs",
+        )
+
+    async def reject_search(*_args, **_kwargs):
+        raise EpicPatientSearchRejected(
+            "Epic could not return patient candidates. Check your "
+            "organization's minimum demographics and Patient.Search "
+            "support or configuration.",
+            provider_issue_codes=("required", "patient-specific-detail"),
+            provider_issue_severities=("error", "patient-specific-detail"),
+        )
+
+    monkeypatch.setattr(EpicSmartClient, "exchange_code", exchange)
+    monkeypatch.setattr(EpicSmartClient, "search_patients", reject_search)
+    callback = client.get(
+        "/api/epic/callback",
+        params={"state": state, "code": "provider-code"},
+        follow_redirects=False,
+    )
+    assert callback.status_code == 307
+
+    with caplog.at_level(logging.WARNING, logger="uvicorn.error"):
+        response = client.post(
+            f"/api/patient-search/sessions/{session_id}/search",
+            json={
+                "givenName": "Sample",
+                "familyName": "Patient",
+                "birthDate": "1980-01-01",
+            },
+        )
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == (
+        "The provider rejected the patient search. Check its search "
+        "requirements and Patient.Search access."
+    )
+    assert '"provider_issue_codes": ["required"]' in caplog.text
+    assert '"provider_issue_severities": ["error"]' in caplog.text
+    assert "patient-specific-detail" not in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("patient", "scope"),
+    [
+        ("synthetic-patient", "openid fhirUser user/Patient.rs"),
+        (None, "openid fhirUser user/Patient.s"),
+        (None, "openid fhirUser user/Patient.r"),
+    ],
+)
+def test_patient_search_rejects_patient_bound_or_incomplete_provider_grants(
+    patient: str | None,
+    scope: str,
+) -> None:
+    with pytest.raises(ValueError):
+        EpicConnector._validate_search_token(
+            EpicToken(
+                access_token="synthetic-token",
+                patient=patient,
+                expires_in=3600,
+                scope=scope,
+            )
+        )
 
 
 def test_patient_claim_search_uses_shared_session_and_all_dates(
@@ -229,7 +532,8 @@ def test_patient_claim_search_reports_missing_eob_permissions(
     scope: str,
 ) -> None:
     session_id = authorize(TestClient(api.app), "synthetic-patient-a")
-    connector = api.connectors["epic"]
+    provider = api.connectors["epic"]
+    connector = provider.connector
     assert isinstance(connector, EpicConnector)
     token = connector._sessions[session_id].token
     assert token is not None
@@ -266,7 +570,7 @@ def test_patient_claim_search_reports_stale_scope_binding(
     assert saved is not None
     saved["binding"] = "previous-scope-binding"
     store.save("epic", session_id, saved, saved["connection_expires_at"])
-    api.connectors["epic"] = EpicConnector()
+    api.connectors["epic"] = _epic_provider(EpicConnector())
 
     response = TestClient(api.app).get(f"/api/sessions/{session_id}/financial/claims")
 
@@ -431,13 +735,18 @@ def test_restart_isolation_refresh_and_local_revocation(
 
     api.sessions.clear()
     restored = EpicConnector()
-    monkeypatch.setattr(api, "connectors", {"epic": restored})
+    monkeypatch.setattr(api, "connectors", {"epic": _epic_provider(restored)})
     for session_id, patient in (
         (first, "synthetic-patient-a"),
         (second, "synthetic-patient-b"),
     ):
         response = client.get(f"/api/sessions/{session_id}")
-        assert response.json() == {"connected": True, "patientId": patient}
+        assert response.json() == {
+            "connected": True,
+            "patientId": patient,
+            "authorizationState": "authorized",
+            "supportedOperations": ["patient_search", "patient_chat", "claims"],
+        }
     assert api.sessions[first].messages == []
     with pytest.raises(ValueError, match="authorization does not match"):
         asyncio.run(restored.get_connection_status(first, "synthetic-patient-b"))
@@ -461,7 +770,9 @@ def test_restart_isolation_refresh_and_local_revocation(
     )
     assert client.delete(f"/api/sessions/{first}").status_code == 204
     api.sessions.clear()
-    monkeypatch.setattr(api, "connectors", {"epic": EpicConnector()})
+    monkeypatch.setattr(
+        api, "connectors", {"epic": _epic_provider(EpicConnector())}
+    )
     assert client.get(f"/api/sessions/{first}").status_code == 404
     assert client.get(f"/api/sessions/{second}").json()["connected"]
 
@@ -684,7 +995,7 @@ def test_changed_configuration_rejects_restored_connection(
     session_id = authorize(client, "synthetic-patient-a")
     api.sessions.clear()
     connector = EpicConnector()
-    monkeypatch.setattr(api, "connectors", {"epic": connector})
+    monkeypatch.setattr(api, "connectors", {"epic": _epic_provider(connector)})
     config = EpicConfig(
         _env_file=None,
         client_id="different-synthetic-client",
