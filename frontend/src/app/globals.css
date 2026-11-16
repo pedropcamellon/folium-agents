@@ -177,14 +177,26 @@ textarea {
   display: flex;
   align-items: center;
   padding: 0 1rem;
+  border: 0;
   border-bottom: 3px solid transparent;
+  border-radius: 0;
+  background: transparent;
   color: #40566d;
   font-size: 0.84rem;
   font-weight: 700;
 }
 
+.ehr-nav .nav-item:hover:not(:disabled) {
+  background: #edf3f8;
+}
+
 .nav-item.active {
   border-bottom-color: var(--blue);
+  color: var(--navy-deep);
+}
+
+.ehr-nav .nav-item.active {
+  background: transparent;
   color: var(--navy-deep);
 }
 
@@ -492,6 +504,30 @@ h3 {
   width: 100%;
   margin-top: 0.35rem;
   font-size: 0.78rem;
+}
+
+.patient-dialog {
+  width: min(92vw, 480px);
+  max-width: 480px;
+  padding: 0;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  color: var(--ink);
+}
+
+.patient-dialog::backdrop {
+  background: rgb(16 43 73 / 48%);
+}
+
+.patient-dialog .patient-selector {
+  margin: 0;
+  padding: 1.4rem;
+}
+
+.dialog-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.65rem;
 }
 
 .context-action {

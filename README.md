@@ -19,6 +19,11 @@ Open **http://localhost:3000** after the services start. Select a sandbox
 patient and authorize Epic access in the chat. The API runs at
 http://localhost:8000; the CLI is optional and does not start with the web app.
 
+Use the same patient-scoped chat for Clinical and Financials questions.
+The assistant can read supported chart resources or Epic patient claims and
+cite the returned evidence. It does not execute financial actions; EOB
+adjudication does not establish internal payment-posting status.
+
 First-time setup: see [Epic and model configuration](docs/epic-chat.md#epic-and-model-configuration)
 for `.env` settings, model credentials, and the registered Epic callback.
 Use synthetic sandbox data only; local Compose logs model answers.

@@ -49,6 +49,24 @@ types are provisional until the configured Epic sandbox confirms the search
 interactions and the app registration grants the required SMART permissions.
 `CapabilityStatement` metadata alone does not grant application access.
 
+The same patient-bound chat supports Financials questions through the
+argument-free `get_patient_claims` tool. Its incremental permission is
+`user/ExplanationOfBenefit.rs` (equivalent returned read/search grants are
+accepted). Reauthorize saved connections after a requested scope change.
+Claims search uses `use=claim`, covers all available dates for that patient, validates patient
+ownership, and fails explicitly if retrieval is incomplete. EOB amounts are
+not internal posting or balance evidence. No Account permission, mock fallback,
+posting operation, or specialized financial workflow is enabled.
+
+If Epic returns its specific no-results code `4101` with a consistent empty
+claims-only response, chat reports that no matching claims were returned.
+This is not a permission failure or proof of a zero balance. Prior
+authorization data is not requested; unknown warnings or suppression still
+prevent a completed claim search.
+Coverage limitations are returned separately from retrieval warnings, so
+ordinary grant boundaries do not label a successfully completed search
+incomplete.
+
 The model endpoint should use the Azure OpenAI-compatible v1 path, for example
 `https://<resource>.openai.azure.com/openai/v1`. Set `FOLIUM_AGENTS_MODEL_NAME`
 to the Azure deployment name, not the underlying model family. The API key is

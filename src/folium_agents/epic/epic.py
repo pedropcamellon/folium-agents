@@ -14,6 +14,8 @@ from urllib.parse import urlencode
 import httpx
 import jwt
 import keyring
+from cryptography.hazmat.primitives.asymmetric.ec import EllipticCurvePrivateKey
+from cryptography.hazmat.primitives.asymmetric.rsa import RSAPrivateKey
 from cryptography.hazmat.primitives.serialization import load_pem_private_key
 from pydantic import SecretStr, ValidationError
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -42,7 +44,8 @@ DEFAULT_EPIC_FHIR_ISSUER = "https://fhir.epic.com/interconnect-fhir-oauth/api/FH
 DEFAULT_EPIC_SCOPE = "openid fhirUser user/Patient.rs"
 MEDICATION_REVIEW_SCOPE = (
     "openid fhirUser launch/patient patient/MedicationRequest.rs "
-    "patient/AllergyIntolerance.rs patient/Condition.rs patient/Patient.r"
+    "patient/AllergyIntolerance.rs patient/Condition.rs patient/Patient.r "
+    "user/ExplanationOfBenefit.rs"
 )
 TOKEN_KEYRING_SERVICE = "folium-agents-epic"
 
@@ -304,6 +307,8 @@ class EpicSmartClient:
             else None
         )
         private_key = load_pem_private_key(private_key_bytes, password=passphrase)
+        if not isinstance(private_key, (RSAPrivateKey, EllipticCurvePrivateKey)):
+            raise TypeError("Epic client assertions require an RSA or EC private key.")
         now = int(time.time())
         claims = {
             "iss": config.client_id,

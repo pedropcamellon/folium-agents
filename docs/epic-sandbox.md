@@ -56,6 +56,76 @@ The sandbox contains synthetic test data. This does not authorize access to
 production systems; each Epic customer controls and approves its own
 connection.
 
+## Patient Scope authorization
+
+Select **Set patient** and enter a known Patient FHIR ID in the dialog. One
+SMART PKCE authorization requests the explicit read/search resources used by
+the current Clinical and Claims features. The request includes the clinical
+patient-context scopes and `user/ExplanationOfBenefit.rs`; it does not request
+wildcard access. One chat handles Clinical and Financials questions using that
+patient-bound connection. The model can select chart reads or patient claim
+search without a separate tab or Investigate action. Changing the patient
+clears the conversation and starts a new authorization context. Use the
+same hostname for the app and registered callback (for example, `localhost`)
+so the browser can return the session.
+
+The Epic app must enable the required MedicationRequest, AllergyIntolerance,
+Condition, Patient, and ExplanationOfBenefit interactions for the relevant
+user types. Epic may return the EOB read and search permissions separately as
+`user/ExplanationOfBenefit.r` and `user/ExplanationOfBenefit.s`. The EOB
+search uses the shared authorization and validates every returned EOB against
+the selected patient. If Epic returns an explicit scope list, it must include
+the combined `.rs` permission or both `.r` and `.s`; a missing permission is
+reported separately from an expired session or malformed response. When the
+requested scopes change, an older saved connection must be reauthorized before
+it can be used for Claims.
+
+Epic's current [Claim Search specification](https://fhir.epic.com/Specifications?api=1073)
+marks `patient` as required and `created` as optional. Financials sends
+`use=claim` and omits `created` to search all available claim dates for that
+patient. Omitting `use` also requests prior authorizations, which are outside
+this feature's scope and can generate a subtype-specific suppression warning.
+Pagination stays on
+the same host and resource; an included patient filter must match, and each
+EOB on every page must reference the selected patient. Duplicate IDs and
+invalid results are rejected, including EOBs whose `use` is not `claim`.
+Search stops after 10 pages, 1,000 records, or
+60 seconds with an explicit failure instead of accepting partial evidence.
+If a limit is reached, the request fails; it never presents a partial list as
+complete.
+
+Epic's current [Claim Search specification](https://fhir.epic.com/Specifications?api=1073)
+marks `patient` as required and `created` as optional. The app does not
+enumerate patients, assume an organization-wide queue, or fall back to local
+fixtures. A rejected request reports the upstream HTTP status without exposing
+provider diagnostics. Successful results show source, selected patient,
+retrieval completeness, pagination, coverage limitations, and EOB amounts
+without inventing an outstanding balance.
+
+EOB adjudication is not internal posting evidence. Investigation and posting
+preview remain unavailable for Epic records until remittance and internal
+posting sources are verified. Chat can summarize returned EOB evidence with
+citations and limitations; it cannot post payments or infer internal balances.
+The shared chat does not call the legacy synthetic investigation API and never
+falls back to its fixtures.
+
+Live diagnosis on 2026-11-15 confirmed that the original suppression warning
+was specifically for the unauthorized **Prior Auth** EOB subtype, not Claim.
+Adding the documented `use=claim` filter removed that warning without adding
+OAuth permissions. The selected patient's claims-only request returned HTTP
+200 with code `4101`, Epic's documented no-results outcome.
+
+The app recognizes warning-level `processing` with numeric code `4101` as an
+empty completed search only when it is consistent with the bundle total,
+contains no claim records, and has no next page. It continues to reject other
+warnings, suppression, errors, contradictory totals, and incomplete results.
+Chat reports a completed empty claim search without inventing a zero balance
+or posting status. This path was verified through the live shared chat after
+reauthorization, with zero retrieval warnings and coverage notes displayed
+separately. A populated live claim list still requires an authorized
+sandbox patient with claim fixtures; clinical records do not imply that such
+fixtures exist.
+
 The standalone MedicationRequest review command has been superseded by the
 open-flow web chat. Its currently implemented resource coverage is provisional
 until actual Epic sandbox interactions and app scopes are confirmed. Offline

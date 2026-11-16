@@ -78,6 +78,7 @@ services:
     environment:
       NODE_ENV: development
       NEXT_PUBLIC_FOLIUM_AGENTS_API_URL: http://localhost:8000
+      FOLIUM_AGENTS_INTERNAL_API_URL: http://api:8000
     command:
       - sh
       - -c

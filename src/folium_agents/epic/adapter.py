@@ -18,7 +18,16 @@ from folium_agents.core.ehr import (
     PatientDemographics,
 )
 from folium_agents.epic.epic import MEDICATION_REVIEW_SCOPE, EpicConfig, EpicSmartClient
+from folium_agents.epic.financial_reads import (
+    ClaimSearch,
+    search_claims,
+    validate_claim_search_scope,
+)
 from folium_agents.epic.models import EpicToken, SmartConfiguration
+
+
+class EpicReauthorizationRequired(ValueError):
+    pass
 
 
 class SavedEpicConnection(BaseModel):
@@ -114,9 +123,9 @@ class EpicConnector:
             expected_state=session.state,
             code_verifier=session.verifier,
         )
-        self._validate_token(token, session.patient_id)
+        lifetime = self._validate_token(token, session.patient_id)
         session.token = token
-        session.expires_at = time.time() + token.expires_in
+        session.expires_at = time.time() + lifetime
         session.verifier = ""
         session.state = ""
         self._save(session_id, session)
@@ -215,6 +224,18 @@ class EpicConnector:
             ),
         )
 
+    async def search_patient_claims(self, session_id: str) -> ClaimSearch:
+        session = self._session(session_id)
+        token = await self._access_token(session)
+        validate_claim_search_scope(token.scope)
+        async with httpx.AsyncClient() as client:
+            return await search_claims(
+                issuer=self._config().issuer,
+                access_token=token.access_token,
+                patient_id=session.patient_id,
+                client=client,
+            )
+
     def end_session(self, session_id: str) -> None:
         self._sessions.pop(session_id, None)
         if self._store:
@@ -231,42 +252,44 @@ class EpicConnector:
             and session.expires_at > time.time() + 30
         ):
             return session.token
-        if session.token is None or not session.token.refresh_token:
+        previous = session.token
+        refresh_token = previous.refresh_token if previous is not None else None
+        if previous is None or not refresh_token:
             session.token = None
             self._discard_token(session)
             diagnostic("oauth.reauthorization_required")
-            raise ValueError(
-                "Epic authorization expired. Start a new chat session to reconnect."
+            raise EpicReauthorizationRequired(
+                "Epic patient authorization expired. Reauthorize this patient."
             )
-        previous = session.token
         diagnostic("oauth.refresh_started")
         try:
             token = await EpicSmartClient(self._config()).refresh_access_token(
                 session.smart,
-                previous.refresh_token,
+                refresh_token,
             )
         except httpx.HTTPStatusError as error:
             diagnostic("oauth.refresh_failed", error=error)
             if error.response.status_code in {400, 401}:
                 session.token = None
                 self._discard_token(session)
-                raise ValueError(
-                    "Epic refresh authorization was rejected. Start a new chat "
-                    "session to reconnect."
+                raise EpicReauthorizationRequired(
+                    "Epic refresh authorization was rejected. Reauthorize this patient."
                 ) from error
             raise
         if token.patient is None:
             token.patient = previous.patient
         if token.refresh_token is None:
             token.refresh_token = previous.refresh_token
+        if token.scope is None:
+            token.scope = previous.scope
         try:
-            self._validate_token(token, session.patient_id)
+            lifetime = self._validate_token(token, session.patient_id)
         except ValueError:
             session.token = None
             self._discard_token(session)
             raise
         session.token = token
-        session.expires_at = time.time() + token.expires_in
+        session.expires_at = time.time() + lifetime
         diagnostic("oauth.refresh_completed")
         for session_id, candidate in self._sessions.items():
             if candidate is session:
@@ -294,7 +317,10 @@ class EpicConnector:
             if payload:
                 saved = SavedEpicConnection.model_validate(payload)
                 if saved.binding != self._binding():
-                    raise ValueError("Connection configuration changed; reconnect.")
+                    raise EpicReauthorizationRequired(
+                        "Epic authorization settings changed. Reauthorize this patient "
+                        "to request the current Clinical and Claims permissions."
+                    )
                 token = saved.token
                 self._validate_token(token, saved.patient_id)
                 self._sessions[session_id] = EpicSession(
@@ -309,26 +335,39 @@ class EpicConnector:
         try:
             session = self._sessions[session_id]
         except KeyError:
-            raise ValueError("Epic connection session is unavailable.") from None
+            raise EpicReauthorizationRequired(
+                "Epic patient authorization is unavailable. Reauthorize this patient."
+            ) from None
         if (
             session.connection_expires_at
             and session.connection_expires_at <= time.time()
         ):
             self.end_session(session_id)
-            raise ValueError("Epic connection expired; reconnect.")
+            raise EpicReauthorizationRequired(
+                "Epic patient authorization expired. Reauthorize this patient."
+            )
         return session
 
     @staticmethod
     def _validate_patient(session: EpicSession, patient_id: str) -> None:
         if session.patient_id != patient_id:
-            raise ValueError("FHIR request patient did not match active context.")
+            raise EpicReauthorizationRequired(
+                "Epic authorization does not match the selected patient. "
+                "Reauthorize this patient."
+            )
 
     @staticmethod
-    def _validate_token(token: EpicToken, patient_id: str) -> None:
+    def _validate_token(token: EpicToken, patient_id: str) -> int:
         if token.patient != patient_id:
-            raise ValueError("Authorized Epic patient did not match selected context.")
+            raise EpicReauthorizationRequired(
+                "Epic authorization does not match the selected patient. "
+                "Reauthorize this patient."
+            )
         if token.expires_in is None or token.expires_in <= 0:
-            raise ValueError("Epic returned a token without a valid lifetime.")
+            raise EpicReauthorizationRequired(
+                "Epic authorization is invalid. Reauthorize this patient."
+            )
+        return token.expires_in
 
     @staticmethod
     def _config() -> EpicConfig:

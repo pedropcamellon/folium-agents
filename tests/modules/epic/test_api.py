@@ -1,6 +1,7 @@
 import asyncio
+from collections.abc import Sequence
 from types import SimpleNamespace
-from typing import Self
+from typing import Any, Self
 from unittest.mock import Mock
 
 import httpx
@@ -16,14 +17,21 @@ from folium_agents.core.ehr import (
     EvidenceRecord,
     PatientDemographics,
 )
+from folium_agents.epic.adapter import EpicConnector
+from folium_agents.epic.financial_reads import (
+    ClaimEvidence,
+    ClaimSearch,
+    FinancialReadError,
+)
 
 
 def _mock_openai(
     monkeypatch: pytest.MonkeyPatch,
-    responses: list[dict[str, object]],
-    requests: list[dict[str, object]] | None = None,
+    responses: Sequence[dict[str, Any]],
+    requests: list[dict[str, Any]] | None = None,
 ) -> None:
     captured = requests if requests is not None else []
+    remaining = list(responses)
 
     class FakeAsyncOpenAI:
         def __init__(self, **options: object) -> None:
@@ -36,9 +44,9 @@ def _mock_openai(
         async def __aexit__(self, *_args: object) -> None:
             return None
 
-        async def create(self, **request: object) -> SimpleNamespace:
+        async def create(self, **request: Any) -> SimpleNamespace:
             captured.append(request)
-            payload = responses.pop(0)
+            payload = remaining.pop(0)
             message = payload["choices"][0]["message"]
             calls = [
                 SimpleNamespace(
@@ -56,6 +64,128 @@ def _mock_openai(
             )
 
     monkeypatch.setattr(api, "AsyncOpenAI", FakeAsyncOpenAI)
+
+
+@pytest.mark.parametrize("result_kind", ["populated", "missing-scope", "empty"])
+def test_chat_selects_patient_claims_without_reading_clinical_chart(
+    monkeypatch: pytest.MonkeyPatch, result_kind: str
+) -> None:
+    connector = EpicConnector()
+    patient_id = "synthetic-patient"
+    session_id = "synthetic-financial-chat"
+    called: list[str] = []
+
+    async def status(_session: str, patient: str) -> EHRConnectionStatus:
+        assert patient == patient_id
+        return EHRConnectionStatus(connected=True, patient_id=patient_id)
+
+    async def claims(selected_session: str) -> ClaimSearch:
+        assert selected_session == session_id
+        called.append("claims")
+        if result_kind == "missing-scope":
+            raise FinancialReadError("Epic authorization is missing EOB permissions.")
+        return ClaimSearch(
+            patient_id=patient_id,
+            claims=[
+                ClaimEvidence(
+                    claim_id="claim-1",
+                    status="active",
+                    created="2020-01-01",
+                    source_id="ExplanationOfBenefit/claim-1",
+                    amounts=[],
+                )
+            ]
+            if result_kind == "populated"
+            else [],
+            pages=1,
+            complete=True,
+            limitations=["EOB adjudication is not internal posting status."],
+        )
+
+    async def chart(_session: str, _patient: str) -> ChartEvidence:
+        raise AssertionError("A financial question must not force a Clinical read.")
+
+    monkeypatch.setattr(connector, "get_connection_status", status)
+    monkeypatch.setattr(connector, "search_patient_claims", claims)
+    monkeypatch.setattr(connector, "retrieve_patient_chart", chart)
+    monkeypatch.setattr(api, "connectors", {"epic": connector})
+    monkeypatch.setattr(api.settings, "model_name", "synthetic-model")
+    monkeypatch.setattr(api.settings, "model_api_key", "synthetic-key")
+    monkeypatch.setattr(api.settings, "model_base_url", "https://model.example.test/v1")
+    api.sessions[session_id] = api_models.ChatSessionState(
+        patient_id=patient_id, provider_id="epic", authorization_state=""
+    )
+    requests: list[dict[str, Any]] = []
+    _mock_openai(
+        monkeypatch,
+        [
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "tool_calls": [
+                                {
+                                    "id": "claims-call",
+                                    "function": {
+                                        "name": "get_patient_claims",
+                                        "arguments": "{}",
+                                    },
+                                }
+                            ]
+                        }
+                    }
+                ]
+            },
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "content": (
+                                '{"answer":"One claim; posting status is unknown.","citations":'
+                                '[{"sourceType":"ExplanationOfBenefit","sourceId":"claim-1"}]}'
+                                if result_kind == "populated"
+                                else '{"answer":"The balance is zero.","citations":[]}'
+                            )
+                        }
+                    }
+                ]
+            },
+        ],
+        requests,
+    )
+    response = TestClient(api.app).post(
+        f"/api/sessions/{session_id}/chat",
+        json={"question": "What claims are on file?"},
+    )
+    assert response.status_code == 200
+    assert called == ["claims"]
+    payload = response.json()
+    assert {tool["name"] for tool in requests[0]["tools"]} == {
+        "get_patient_chart",
+        "get_patient_claims",
+    }
+    if result_kind == "missing-scope":
+        assert payload["sources"] == []
+        assert "missing EOB permissions" in payload["warnings"][0]
+        assert "no usable records" in payload["answer"]
+    elif result_kind == "empty":
+        assert payload["sources"] == []
+        assert payload["warnings"] == []
+        assert payload["limitations"] == [
+            "EOB adjudication is not internal posting status."
+        ]
+        assert "claims-only search completed" in payload["answer"]
+        assert "no matching claims" in payload["answer"]
+        assert "The balance is zero" not in payload["answer"]
+        assert "no usable records" not in payload["answer"]
+    else:
+        assert payload["sources"][0]["sourceId"] == "claim-1"
+        assert "posting status is unknown" in payload["answer"]
+        assert payload["warnings"] == []
+        assert payload["limitations"] == [
+            "EOB adjudication is not internal posting status."
+        ]
+    assert api.sessions[session_id].messages[-1].content == payload["answer"]
 
 
 @pytest.fixture(autouse=True)
@@ -111,7 +241,7 @@ def test_missing_citations_fail_without_additional_model_calls(
             ]
         },
     ]
-    requests: list[dict[str, object]] = []
+    requests: list[dict[str, Any]] = []
     _mock_openai(monkeypatch, responses, requests)
     monkeypatch.setattr(api.settings, "model_name", "synthetic-model")
     monkeypatch.setattr(api.settings, "model_api_key", "synthetic-key")
@@ -247,6 +377,7 @@ def test_chat_api_returns_answer_and_sources_separately(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Show readable answers with supporting records listed once in the source panel."""
+
     # Arrange: supply an authorized chart and a predictable, sourced model answer.
     class ChartConnector(FakeConnector):
         async def retrieve_patient_chart(
@@ -278,7 +409,7 @@ def test_chat_api_returns_answer_and_sources_separately(
     api.sessions["synthetic-session"] = api_models.ChatSessionState(
         patient_id="synthetic-patient", provider_id="fake", authorization_state=""
     )
-    requests: list[dict[str, object]] = []
+    requests: list[dict[str, Any]] = []
     _mock_openai(
         monkeypatch,
         [
@@ -500,7 +631,7 @@ def test_chat_hides_model_configuration_details_from_user(
     # Assert: show a safe message and retain operator-only diagnostics.
     assert response.status_code == 502
     assert response.json()["detail"] == (
-        "The chart assistant could not complete this request. Please try again later."
+        "The patient assistant could not complete this request. Please try again later."
     )
     assert "FOLIUM_AGENTS_MODEL_API_KEY is not configured." in caplog.text
     assert "could not retrieve or compose a grounded answer" not in response.text
@@ -699,7 +830,7 @@ def test_model_preserves_follow_up_context_and_multiresource_citations(
             ]
         },
     ]
-    requests: list[dict[str, object]] = []
+    requests: list[dict[str, Any]] = []
 
     class FakeAsyncClient:
         def __init__(self, *, timeout: float) -> None:
@@ -865,6 +996,7 @@ def test_model_rejects_unregistered_tool_calls(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Prevent the assistant from requesting unapproved actions on a patient's chart."""
+
     # Arrange: simulate a model attempting an unapproved chart action.
     class FakeAsyncClient:
         def __init__(self, *, timeout: float) -> None:

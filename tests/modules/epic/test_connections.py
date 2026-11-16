@@ -3,6 +3,7 @@ import logging
 import shutil
 import time
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 from uuid import uuid4
 
 import httpx
@@ -15,7 +16,7 @@ from folium_agents.api import app as api
 from folium_agents.api.models import ChatMessage
 from folium_agents.core.connections import ConnectionStore
 from folium_agents.epic.adapter import EpicConnector
-from folium_agents.epic.epic import EpicConfig, EpicSmartClient
+from folium_agents.epic.epic import MEDICATION_REVIEW_SCOPE, EpicConfig, EpicSmartClient
 from folium_agents.epic.models import EpicToken, SmartConfiguration
 
 
@@ -32,6 +33,7 @@ def persistent_connections(monkeypatch: pytest.MonkeyPatch):
         _env_file=None,
         client_id="synthetic-client",
         redirect_uri="https://app.example.test/api/epic/callback",
+        scope=MEDICATION_REVIEW_SCOPE,
     )
     monkeypatch.setattr(EpicConnector, "_config", staticmethod(lambda: config))
 
@@ -48,6 +50,10 @@ def persistent_connections(monkeypatch: pytest.MonkeyPatch):
             refresh_token=f"secret-refresh-{kwargs['code']}",
             patient=kwargs["code"],
             expires_in=3600,
+            scope=(
+                "openid fhirUser user/ExplanationOfBenefit.r "
+                "user/ExplanationOfBenefit.s"
+            ),
         )
 
     monkeypatch.setattr(EpicSmartClient, "discover", discover)
@@ -74,6 +80,330 @@ def authorize(client: TestClient, patient: str) -> str:
     )
     assert callback.status_code == 307
     return session_id
+
+
+def test_patient_authorization_requests_combined_explicit_scopes(
+    persistent_connections,
+) -> None:
+    client = TestClient(api.app)
+    response = client.post(
+        "/api/sessions",
+        json={"patientId": "synthetic-patient-a"},
+    )
+    assert response.status_code == 200
+    authorization_url = response.json()["authorizationUrl"]
+    scopes = parse_qs(urlparse(authorization_url).query)["scope"][0].split()
+    assert scopes == MEDICATION_REVIEW_SCOPE.split()
+    assert "patient/MedicationRequest.rs" in scopes
+    assert "user/ExplanationOfBenefit.rs" in scopes
+    assert not any(scope.startswith("system/") for scope in scopes)
+
+
+def test_patient_claim_search_uses_shared_session_and_all_dates(
+    persistent_connections,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from folium_agents.epic import financial_reads
+
+    session_id = authorize(TestClient(api.app), "synthetic-patient-a")
+    calls: list[httpx.Request] = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        assert request.url.params.get_list("patient") == ["synthetic-patient-a"]
+        assert "created" not in request.url.params
+        if len(calls) == 1:
+            assert request.url.params.get("use") == "claim"
+        claim_id = f"CLAIM-{len(calls)}"
+        created = "2010-03-05" if len(calls) == 1 else "2026-01-15"
+        bundle = {
+            "resourceType": "Bundle",
+            "type": "searchset",
+            "total": 2,
+            "entry": [
+                {
+                    "resource": {
+                        "resourceType": "ExplanationOfBenefit",
+                        "use": "claim",
+                        "id": claim_id,
+                        "status": "active",
+                        "created": created,
+                        "patient": {"reference": "Patient/synthetic-patient-a"},
+                        "total": [],
+                    }
+                }
+            ],
+        }
+        if len(calls) == 1:
+            bundle["link"] = [
+                {
+                    "relation": "next",
+                    "url": (
+                        "https://fhir.epic.com/interconnect-fhir-oauth/api/FHIR/R4/"
+                        "ExplanationOfBenefit?patient=synthetic-patient-a&page=2"
+                    ),
+                }
+            ]
+        return httpx.Response(
+            200,
+            json=bundle,
+        )
+
+    original = httpx.AsyncClient
+    monkeypatch.setattr(
+        financial_reads.httpx,
+        "AsyncClient",
+        lambda: original(transport=httpx.MockTransport(handle)),
+    )
+    response = TestClient(api.app).get(f"/api/sessions/{session_id}/financial/claims")
+    assert response.status_code == 200
+    assert response.json()["patientId"] == "synthetic-patient-a"
+    assert response.json()["pages"] == 2
+    assert response.json()["complete"] is True
+    assert [claim["created"] for claim in response.json()["claims"]] == [
+        "2010-03-05",
+        "2026-01-15",
+    ]
+    assert len(calls) == 2
+
+
+@pytest.mark.parametrize(
+    ("patient", "use"),
+    [
+        ("synthetic-patient-b", "claim"),
+        ("synthetic-patient-a", "preauthorization"),
+    ],
+)
+def test_patient_claim_search_rejects_wrong_patient_or_nonclaim_eob(
+    persistent_connections,
+    monkeypatch: pytest.MonkeyPatch,
+    patient: str,
+    use: str,
+) -> None:
+    from folium_agents.epic import financial_reads
+
+    session_id = authorize(TestClient(api.app), "synthetic-patient-a")
+
+    def handle(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "resourceType": "Bundle",
+                "type": "searchset",
+                "entry": [
+                    {
+                        "resource": {
+                            "resourceType": "ExplanationOfBenefit",
+                            "use": use,
+                            "id": "CLAIM-OTHER",
+                            "status": "active",
+                            "created": "2010-03-05",
+                            "patient": {"reference": f"Patient/{patient}"},
+                        }
+                    }
+                ],
+            },
+        )
+
+    original = httpx.AsyncClient
+    monkeypatch.setattr(
+        financial_reads.httpx,
+        "AsyncClient",
+        lambda: original(transport=httpx.MockTransport(handle)),
+    )
+    response = TestClient(api.app).get(f"/api/sessions/{session_id}/financial/claims")
+    assert response.status_code == 424
+    assert "claims" not in response.json()
+
+
+@pytest.mark.parametrize(
+    "scope",
+    [
+        "openid user/Patient.r",
+        "user/ExplanationOfBenefit.r",
+        "user/ExplanationOfBenefit.s",
+    ],
+)
+def test_patient_claim_search_reports_missing_eob_permissions(
+    persistent_connections,
+    scope: str,
+) -> None:
+    session_id = authorize(TestClient(api.app), "synthetic-patient-a")
+    connector = api.connectors["epic"]
+    assert isinstance(connector, EpicConnector)
+    token = connector._sessions[session_id].token
+    assert token is not None
+    token.scope = scope
+
+    response = TestClient(api.app).get(f"/api/sessions/{session_id}/financial/claims")
+
+    assert response.status_code == 424
+    assert (
+        "missing ExplanationOfBenefit read and search permissions"
+        in response.json()["detail"]
+    )
+
+
+def test_claim_pagination_rejects_a_prior_authorization_filter() -> None:
+    from folium_agents.epic.financial_reads import FinancialReadError, next_page_url
+
+    base = "https://fhir.epic.com/interconnect-fhir-oauth/api/FHIR/R4"
+    with pytest.raises(FinancialReadError, match="non-claim pagination"):
+        next_page_url(
+            base,
+            f"{base}/ExplanationOfBenefit",
+            "?patient=synthetic-patient-a&use=preauthorization",
+            "synthetic-patient-a",
+        )
+
+
+def test_patient_claim_search_reports_stale_scope_binding(
+    persistent_connections,
+) -> None:
+    _directory, store, _connector = persistent_connections
+    session_id = authorize(TestClient(api.app), "synthetic-patient-a")
+    saved = store.load("epic", session_id)
+    assert saved is not None
+    saved["binding"] = "previous-scope-binding"
+    store.save("epic", session_id, saved, saved["connection_expires_at"])
+    api.connectors["epic"] = EpicConnector()
+
+    response = TestClient(api.app).get(f"/api/sessions/{session_id}/financial/claims")
+
+    assert response.status_code == 401
+    assert "authorization settings changed" in response.json()["detail"]
+    assert "Patient claim access is unavailable" not in response.json()["detail"]
+
+
+def test_patient_claim_search_reports_invalid_claim_date(
+    persistent_connections,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from folium_agents.epic import financial_reads
+
+    session_id = authorize(TestClient(api.app), "synthetic-patient-a")
+
+    def handle(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "resourceType": "Bundle",
+                "type": "searchset",
+                "entry": [
+                    {
+                        "resource": {
+                            "resourceType": "ExplanationOfBenefit",
+                            "use": "claim",
+                            "id": "CLAIM-INVALID-DATE",
+                            "status": "active",
+                            "created": "not-a-date",
+                            "patient": {"reference": "Patient/synthetic-patient-a"},
+                            "total": [],
+                        }
+                    }
+                ],
+            },
+        )
+
+    original = httpx.AsyncClient
+    monkeypatch.setattr(
+        financial_reads.httpx,
+        "AsyncClient",
+        lambda: original(transport=httpx.MockTransport(handle)),
+    )
+    response = TestClient(api.app).get(f"/api/sessions/{session_id}/financial/claims")
+
+    assert response.status_code == 424
+    assert "invalid claim date" in response.json()["detail"]
+    assert "Reauthorize" not in response.json()["detail"]
+
+
+@pytest.mark.parametrize(
+    ("severity", "code", "epic_code", "total", "expected_status", "message"),
+    [
+        (
+            "warning",
+            "suppressed",
+            "59205",
+            0,
+            424,
+            "Epic suppressed claim search results",
+        ),
+        ("warning", "processing", "4101", 0, 200, "no matching claims"),
+        ("warning", "processing", "4101", 1, 424, "processing or access warning"),
+        ("warning", "processing", "unknown", 0, 424, "processing or access warning"),
+        ("warning", "processing", None, 0, 424, "processing or access warning"),
+        ("error", "processing", "4101", 0, 424, "processing or access warning"),
+        (
+            "information",
+            "informational",
+            None,
+            0,
+            200,
+            "informational claim search outcome",
+        ),
+    ],
+)
+def test_patient_claim_search_handles_bundled_operation_outcomes(
+    persistent_connections,
+    monkeypatch: pytest.MonkeyPatch,
+    severity: str,
+    code: str,
+    epic_code: str | None,
+    total: int,
+    expected_status: int,
+    message: str,
+) -> None:
+    from folium_agents.epic import financial_reads
+
+    session_id = authorize(TestClient(api.app), "synthetic-patient-a")
+
+    def handle(_request: httpx.Request) -> httpx.Response:
+        assert _request.url.params["use"] == "claim"
+        return httpx.Response(
+            200,
+            json={
+                "resourceType": "Bundle",
+                "type": "searchset",
+                "total": total,
+                "entry": [
+                    {
+                        "resource": {
+                            "resourceType": "OperationOutcome",
+                            "issue": [
+                                {
+                                    "severity": severity,
+                                    "code": code,
+                                    "details": {
+                                        "coding": [{"code": epic_code}]
+                                        if epic_code
+                                        else [],
+                                    },
+                                    "diagnostics": "untrusted-provider-detail-do-not-display",
+                                }
+                            ],
+                        }
+                    }
+                ],
+            },
+        )
+
+    original = httpx.AsyncClient
+    monkeypatch.setattr(
+        financial_reads.httpx,
+        "AsyncClient",
+        lambda: original(transport=httpx.MockTransport(handle)),
+    )
+    response = TestClient(api.app).get(f"/api/sessions/{session_id}/financial/claims")
+    assert response.status_code == expected_status
+    assert "untrusted-provider-detail" not in response.text
+    if expected_status == 200:
+        assert response.json()["claims"] == []
+        assert response.json()["complete"] is True
+        assert any(message in item for item in response.json()["limitations"])
+    else:
+        assert message in response.json()["detail"]
+        assert "claims" not in response.json()
 
 
 def test_restart_isolation_refresh_and_local_revocation(
@@ -109,7 +439,7 @@ def test_restart_isolation_refresh_and_local_revocation(
         response = client.get(f"/api/sessions/{session_id}")
         assert response.json() == {"connected": True, "patientId": patient}
     assert api.sessions[first].messages == []
-    with pytest.raises(ValueError, match="did not match"):
+    with pytest.raises(ValueError, match="authorization does not match"):
         asyncio.run(restored.get_connection_status(first, "synthetic-patient-b"))
 
     refreshes = []
@@ -126,6 +456,9 @@ def test_restart_isolation_refresh_and_local_revocation(
     saved = store.load("epic", first)
     assert saved["token"]["access_token"] == "rotated-access"
     assert saved["token"]["refresh_token"] == "secret-refresh-synthetic-patient-a"
+    assert saved["token"]["scope"] == (
+        "openid fhirUser user/ExplanationOfBenefit.r user/ExplanationOfBenefit.s"
+    )
     assert client.delete(f"/api/sessions/{first}").status_code == 204
     api.sessions.clear()
     monkeypatch.setattr(api, "connectors", {"epic": EpicConnector()})
@@ -208,7 +541,7 @@ def test_redacted_correlated_diagnostics(
 
     if failure == "fhir":
 
-        async def retrieve_from_model(_messages, retrieve):
+        async def retrieve_from_model(_messages, retrieve, _retrieve_claims=None):
             return await retrieve()
 
         monkeypatch.setattr(connector, "retrieve_patient_chart", fail)

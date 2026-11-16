@@ -61,6 +61,7 @@ class EpicToken(BaseModel):
     refresh_token: str | None = None
     patient: str | None = None
     encounter: str | None = None
+    scope: str | None = None
 
 
 class CachedEpicToken(BaseModel):
@@ -100,7 +101,11 @@ class EpicPatient(BaseModel):
     @property
     def primary_name(self) -> EpicPatientName | None:
         return next(
-            (patient_name for patient_name in self.name if patient_name.given or patient_name.family),
+            (
+                patient_name
+                for patient_name in self.name
+                if patient_name.given or patient_name.family
+            ),
             None,
         )
 
@@ -282,6 +287,7 @@ class FhirOperationIssue(BaseModel):
 
     severity: Literal["fatal", "error", "warning", "information", "success"]
     code: str
+    details: FhirCodeableConcept | None = None
 
 
 class FhirOperationOutcome(BaseModel):

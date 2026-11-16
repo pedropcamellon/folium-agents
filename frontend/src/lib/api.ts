@@ -1,3 +1,5 @@
+import type { EpicClaimSearch } from "@/lib/financial-models";
+
 export type ChatSource = {
   sourceType: string;
   sourceId: string;
@@ -10,6 +12,7 @@ export type ChatResponse = {
   answer: string;
   sources: ChatSource[];
   warnings: string[];
+  limitations: string[];
   sessionId: string;
 };
 
@@ -26,13 +29,17 @@ export type PatientProfile = {
 };
 
 export class ApiRequestError extends Error {
-  constructor(message: string, public readonly status: number) {
+  constructor(
+    message: string,
+    public readonly status: number,
+  ) {
     super(message);
     this.name = "ApiRequestError";
   }
 }
 
-const configuredApiBaseUrl = process.env.NEXT_PUBLIC_FOLIUM_AGENTS_API_URL?.trim();
+const configuredApiBaseUrl =
+  process.env.NEXT_PUBLIC_FOLIUM_AGENTS_API_URL?.trim();
 
 if (!configuredApiBaseUrl && typeof window !== "undefined") {
   console.error(
@@ -47,6 +54,13 @@ function getBrowserHostname(): string {
 }
 
 function getApiBaseUrl(): string {
+  if (typeof window === "undefined") {
+    const internalApiBaseUrl =
+      process.env.FOLIUM_AGENTS_INTERNAL_API_URL?.trim();
+    if (internalApiBaseUrl) {
+      return internalApiBaseUrl.replace(/\/$/, "");
+    }
+  }
   if (configuredApiBaseUrl) {
     const apiBaseUrl =
       typeof window === "undefined"
@@ -65,13 +79,22 @@ function getApiBaseUrl(): string {
   );
 }
 
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
+type ApiOperation =
+  | "chat"
+  | "patient"
+  | "disconnect"
+  | "authorize"
+  | "restore"
+  | "search_epic_claims"
+  | "list_financial_claims"
+  | "investigate_claim";
+
+async function request<T>(
+  operation: ApiOperation,
+  path: string,
+  init?: RequestInit,
+): Promise<T> {
   const apiBaseUrl = getApiBaseUrl();
-  const operation =
-    path.endsWith("/chat") ? "chat" :
-    path.endsWith("/patient") ? "patient" :
-    init?.method === "DELETE" ? "disconnect" :
-    init?.method === "POST" ? "authorize" : "restore";
   let response: Response;
   try {
     response = await fetch(`${apiBaseUrl}${path}`, {
@@ -84,7 +107,10 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     });
   } catch (reason) {
     if (reason instanceof TypeError) {
-      console.error("api.network_failed", { operation, errorType: "TypeError" });
+      console.error("api.network_failed", {
+        operation,
+        errorType: "TypeError",
+      });
       throw new Error(
         `Cannot reach the Folium Agents API at ${apiBaseUrl}. ` +
           "Start the API service and open the app on localhost or 127.0.0.1.",
@@ -94,7 +120,8 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   }
   if (!response.ok) {
     const rawId = response.headers.get("X-Correlation-ID");
-    const correlationId = rawId && /^[a-f0-9]{32}$/.test(rawId) ? rawId : undefined;
+    const correlationId =
+      rawId && /^[a-f0-9]{32}$/.test(rawId) ? rawId : undefined;
     console.error("api.request_failed", {
       operation,
       status: response.status,
@@ -102,16 +129,19 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     });
     if (response.status >= 500) {
       throw new ApiRequestError(
-        "The chart assistant could not complete this request. Please try again later." +
+        "The assistant could not complete this request. Please try again later." +
           (correlationId ? ` Reference: ${correlationId}.` : ""),
         response.status,
       );
     }
-    const body = (await response.json().catch(() => null)) as
-      | { detail?: unknown }
-      | null;
+
+    const body = (await response.json().catch(() => null)) as {
+      detail?: unknown;
+    } | null;
     throw new ApiRequestError(
-      (typeof body?.detail === "string" ? body.detail : `API request failed (${response.status}).`) +
+      (typeof body?.detail === "string"
+        ? body.detail
+        : `API request failed (${response.status}).`) +
         (correlationId ? ` Reference: ${correlationId}.` : ""),
       response.status,
     );
@@ -122,29 +152,86 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return (await response.json()) as T;
 }
 
+export type FinancialClaim = {
+  claimId: string;
+  workspaceId: string;
+  synthetic: boolean;
+  status: string;
+  currency: string;
+  billedCents: number;
+  outstandingCents: number;
+};
+
+export type FinancialRun = {
+  runId: string;
+  workspaceId: string;
+  claimId: string;
+  status: "completed" | "incomplete" | "failed";
+  action: string;
+  humanReviewRequired: boolean;
+  evidence: Record<string, unknown>;
+  preview: Record<string, unknown> | null;
+  citations: string[];
+  trace: {
+    tool: string;
+    outcome: "ok" | "failed";
+    sourceIds: string[];
+    durationMs: number;
+  }[];
+  error: string | null;
+  uncertainties: string[];
+};
+
+export function listFinancialClaims() {
+  return request<FinancialClaim[]>(
+    "list_financial_claims",
+    "/api/financial/claims",
+  );
+}
+
+export function searchEpicClaims(sessionId: string) {
+  return request<EpicClaimSearch>(
+    "search_epic_claims",
+    `/api/sessions/${encodeURIComponent(sessionId)}/financial/claims`,
+  );
+}
+
+export function investigateClaim(claimId: string) {
+  return request<FinancialRun>(
+    "investigate_claim",
+    `/api/financial/claims/${encodeURIComponent(claimId)}/investigate`,
+    { method: "POST" },
+  );
+}
+
 export async function createSession(patientId: string) {
   return request<{
     sessionId: string;
     patientId: string;
     authorizationUrl: string;
-  }>("/api/sessions", {
+  }>("authorize", "/api/sessions", {
     method: "POST",
     body: JSON.stringify({ patientId }),
   });
 }
 
 export function getConnectionStatus(sessionId: string) {
-  return request<ConnectionStatus>(`/api/sessions/${encodeURIComponent(sessionId)}`);
+  return request<ConnectionStatus>(
+    "restore",
+    `/api/sessions/${encodeURIComponent(sessionId)}`,
+  );
 }
 
 export function getPatientProfile(sessionId: string) {
   return request<PatientProfile>(
+    "patient",
     `/api/sessions/${encodeURIComponent(sessionId)}/patient`,
   );
 }
 
 export function sendMessage(sessionId: string, question: string) {
   return request<ChatResponse>(
+    "chat",
     `/api/sessions/${encodeURIComponent(sessionId)}/chat`,
     {
       method: "POST",
@@ -154,7 +241,9 @@ export function sendMessage(sessionId: string, question: string) {
 }
 
 export function clearSession(sessionId: string) {
-  return request<void>(`/api/sessions/${encodeURIComponent(sessionId)}`, {
-    method: "DELETE",
-  });
+  return request<void>(
+    "disconnect",
+    `/api/sessions/${encodeURIComponent(sessionId)}`,
+    { method: "DELETE" },
+  );
 }

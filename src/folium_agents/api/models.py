@@ -56,6 +56,7 @@ class ChatResponse(BaseModel):
     answer: str
     sources: list[ChatSource]
     warnings: list[str]
+    limitations: list[str] = Field(default_factory=list)
     session_id: str = Field(alias="sessionId")
 
 
@@ -90,7 +91,7 @@ class PatientProfile(BaseModel):
 class ChatMessage(BaseModel):
     model_config = ConfigDict(frozen=True)
 
-    role: str
+    role: Literal["assistant", "user"]
     content: str
 
 

@@ -15,6 +15,13 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse
 from openai import AsyncOpenAI, OpenAIError
+from openai.types.responses import (
+    EasyInputMessageParam,
+    FunctionToolParam,
+    ResponseInputParam,
+    ToolParam,
+)
+from openai.types.shared_params.reasoning import Reasoning
 
 from folium_agents.api.models import (
     ApiSettings,
@@ -33,6 +40,9 @@ from folium_agents.api.models import (
 from folium_agents.core.connections import connection_store
 from folium_agents.core.diagnostics import correlation_id, diagnostic
 from folium_agents.core.ehr import EHRConnector
+from folium_agents.epic.adapter import EpicConnector, EpicReauthorizationRequired
+from folium_agents.epic.financial_reads import ClaimSearch, FinancialReadError
+from folium_agents.financial import Claim, Investigation, MockFinancialAPI, investigate
 
 SESSION_TTL_SECONDS = 24 * 60 * 60
 MAX_MODEL_TOOL_CALLS = 3
@@ -47,6 +57,10 @@ MODEL_CONFIGURATION_ERRORS = {
     "FOLIUM_AGENTS_MODEL_BASE_URL is not configured.",
 }
 logger = logging.getLogger(__name__)
+
+
+def _chat_input_message(message: ChatMessage) -> EasyInputMessageParam:
+    return {"role": message.role, "content": message.content}
 
 
 def discover_connectors() -> dict[str, EHRConnector]:
@@ -83,7 +97,7 @@ frontend_origins = {
 app.add_middleware(
     CORSMiddleware,
     allow_origins=sorted(frontend_origins),
-    allow_credentials=False,
+    allow_credentials=True,
     allow_methods=["GET", "POST", "DELETE"],
     allow_headers=["Content-Type", "X-Correlation-ID"],
     expose_headers=["X-Correlation-ID"],
@@ -127,6 +141,44 @@ def _forget_session(session_id: str) -> None:
 @app.get("/healthz")
 async def health_check() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.get("/api/financial/claims", response_model=list[Claim])
+async def financial_claims() -> list[Claim]:
+    return MockFinancialAPI().claims()
+
+
+@app.post("/api/financial/claims/{claim_id}/investigate", response_model=Investigation)
+async def financial_investigate(claim_id: str) -> Investigation:
+    try:
+        MockFinancialAPI().claim(claim_id)
+    except ValueError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    if not all((settings.model_api_key, settings.model_name, settings.model_base_url)):
+        return Investigation(
+            claim_id=claim_id,
+            status="failed",
+            error="Financial model configuration is missing.",
+        )
+    options: dict[str, Any] = {
+        "api_key": settings.model_api_key,
+        "base_url": settings.model_base_url,
+        "timeout": 45.0,
+        "max_retries": 0,
+    }
+    if settings.model_api_key_header == "api-key":
+        options["default_headers"] = {"api-key": settings.model_api_key}
+    try:
+        async with AsyncOpenAI(**options) as client:
+            return await investigate(
+                claim_id, client, settings.model_name, settings.model_reasoning_effort
+            )
+    except (OpenAIError, TypeError, ValueError):
+        return Investigation(
+            claim_id=claim_id,
+            status="failed",
+            error="Financial model client could not start.",
+        )
 
 
 def _session_or_404(session_id: str) -> ChatSessionState:
@@ -325,6 +377,43 @@ async def patient_profile(session_id: str) -> PatientProfile:
     )
 
 
+@app.get(
+    "/api/sessions/{session_id}/financial/claims",
+    response_model=ClaimSearch,
+)
+async def patient_financial_claims(session_id: str) -> ClaimSearch:
+    session = _session_or_404(session_id)
+    connector = connectors.get(session.provider_id)
+    if not isinstance(connector, EpicConnector):
+        raise HTTPException(
+            status_code=501,
+            detail="Patient claim search is not supported by this EHR connection.",
+        )
+    try:
+        return await connector.search_patient_claims(session_id)
+    except EpicReauthorizationRequired as error:
+        diagnostic("financial.claim_search_reauthorization_required", error=error)
+        raise HTTPException(status_code=401, detail=str(error)) from error
+    except FinancialReadError as error:
+        diagnostic("financial.claim_search_blocked", error=error)
+        raise HTTPException(status_code=424, detail=str(error)) from error
+    except ValueError as error:
+        diagnostic("financial.claim_search_failed", error=error)
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "Claim search could not validate the Epic response. "
+                "No claims were accepted."
+            ),
+        ) from error
+    except (httpx.HTTPError, TimeoutError) as error:
+        diagnostic("financial.claim_search_failed", error=error)
+        raise HTTPException(
+            status_code=424,
+            detail="Epic claim search failed. No claims were accepted.",
+        ) from error
+
+
 @app.post("/api/sessions/{session_id}/chat", response_model=ChatResponse)
 async def send_chat_turn(session_id: str, turn: ChatTurn) -> ChatResponse:
     session = _session_or_404(session_id)
@@ -334,6 +423,9 @@ async def send_chat_turn(session_id: str, turn: ChatTurn) -> ChatResponse:
             session_id,
             session.patient_id,
         )
+    except EpicReauthorizationRequired as error:
+        diagnostic("session.authorization_failed", error=error)
+        raise HTTPException(status_code=401, detail=str(error)) from error
     except ValueError as error:
         diagnostic("session.authorization_failed", error=error)
         raise HTTPException(
@@ -358,6 +450,8 @@ async def send_chat_turn(session_id: str, turn: ChatTurn) -> ChatResponse:
 
     sources: list[ChatSource] = []
     warnings: list[str] = []
+    limitations: list[str] = []
+    claim_search: ClaimSearch | None = None
 
     async def get_chart_data() -> str:
         try:
@@ -389,13 +483,48 @@ async def send_chat_turn(session_id: str, turn: ChatTurn) -> ChatResponse:
             )
         return evidence_json
 
+    async def get_claims_data() -> str:
+        nonlocal claim_search
+        claim_search = None
+        if not isinstance(connector, EpicConnector):
+            raise TypeError("Claim search is not supported by this connector.")
+        try:
+            evidence = await connector.search_patient_claims(session_id)
+        except (FinancialReadError, EpicReauthorizationRequired) as error:
+            diagnostic("financial.chat_claim_search_blocked", error=error)
+            warnings.append(str(error))
+            return json.dumps({"error": str(error), "complete": False})
+        if evidence.patient_id != session.patient_id:
+            raise ValueError("Claim evidence did not match the selected patient.")
+        evidence_json = evidence.model_dump_json(by_alias=True)
+        if len(evidence_json) > MAX_TOOL_RESPONSE_CHARS:
+            raise ValueError("Claim evidence exceeded the model input limit.")
+        claim_search = evidence
+        sources.extend(
+            ChatSource(
+                source_type="ExplanationOfBenefit",
+                source_id=claim.claim_id,
+                title="Epic sandbox claim",
+                date=claim.created,
+                status=claim.status,
+            )
+            for claim in evidence.claims
+        )
+        limitations.extend(evidence.limitations)
+        return evidence_json
+
     user_message = ChatMessage(role="user", content=turn.question.strip())
     try:
-        grounded_answer = await _ask_model(
-            [*session.messages, user_message],
-            get_chart_data,
+        model_messages = [*session.messages, user_message]
+        if isinstance(connector, EpicConnector):
+            grounded_answer = await _ask_model(
+                model_messages, get_chart_data, get_claims_data
+            )
+        else:
+            grounded_answer = await _ask_model(model_messages, get_chart_data)
+        answer = _render_grounded_answer(
+            grounded_answer, sources, warnings, claim_search
         )
-        answer = _render_grounded_answer(grounded_answer, sources, warnings)
     except (httpx.HTTPError, OpenAIError, KeyError, TypeError, ValueError) as error:
         if isinstance(error, ValueError) and str(error) in MODEL_CONFIGURATION_ERRORS:
             logger.error("Chat model configuration error: %s", error)
@@ -403,7 +532,7 @@ async def send_chat_turn(session_id: str, turn: ChatTurn) -> ChatResponse:
         raise HTTPException(
             status_code=502,
             detail=(
-                "The chart assistant could not complete this request. "
+                "The patient assistant could not complete this request. "
                 "Please try again later."
             ),
         ) from error
@@ -416,6 +545,7 @@ async def send_chat_turn(session_id: str, turn: ChatTurn) -> ChatResponse:
         answer=answer,
         sources=sources,
         warnings=warnings,
+        limitations=limitations,
         session_id=session_id,
     )
 
@@ -424,19 +554,33 @@ def _render_grounded_answer(
     grounded_answer: GroundedAnswer,
     sources: list[ChatSource],
     warnings: list[str],
+    claim_search: ClaimSearch | None = None,
 ) -> str:
     if not sources:
+        if (
+            claim_search is not None
+            and claim_search.complete
+            and not claim_search.claims
+        ):
+            return (
+                "Epic returned no matching claims for the selected patient across "
+                "all dates available through this authorization. The claims-only "
+                "search completed; prior authorizations were not requested. "
+                "This does not establish that no claims exist outside this "
+                "sandbox or grant, and it does not establish a zero balance "
+                "or payment-posting status."
+            )
         if warnings:
             return (
-                "The authorized chart search returned no usable records and "
-                "reported retrieval warnings. I cannot provide a reliable "
-                "chart-grounded answer. This does not establish that the patient "
-                "has no relevant history."
+                "The authorized patient search returned no usable records. "
+                "Review the retrieval warnings below for access restrictions or "
+                "missing evidence. This does not establish an absence of "
+                "clinical history or claims."
             )
         return (
             "No matching records were returned from the available authorized "
-            "chart searches. This does not establish that the patient has no "
-            "relevant history."
+            "patient searches. This does not establish that the patient has no "
+            "relevant history or claims."
         )
 
     available_sources = {(source.source_type, source.source_id) for source in sources}
@@ -467,6 +611,7 @@ async def delete_session(session_id: str) -> None:
 async def _ask_model(
     messages: list[ChatMessage],
     retrieve_chart: Callable[[], Awaitable[str]],
+    retrieve_claims: Callable[[], Awaitable[str]] | None = None,
 ) -> GroundedAnswer:
     if not settings.model_api_key:
         raise ValueError("FOLIUM_AGENTS_MODEL_API_KEY is not configured.")
@@ -486,14 +631,22 @@ async def _ask_model(
     }
     if settings.model_api_key_header == "api-key":
         client_options["default_headers"] = {"api-key": api_key_value}
-    system_message = {
+    system_message: EasyInputMessageParam = {
         "role": "system",
         "content": (
-            "You are a clinician-facing chart assistant. Use only the registered "
-            "read-only chart tool as evidence for patient-specific claims. Cite "
+            "You are a read-only patient assistant for Clinical and Financials. "
+            "Use get_patient_chart for clinical questions and, when available, "
+            "get_patient_claims for claims or financial questions. Use both only "
+            "when the question needs both. The tools use the selected patient; "
+            "never request or substitute another patient ID. Use only registered "
+            "read-only tools as evidence for patient-specific facts. Cite "
             "each chart fact using a sourceType/sourceId returned by the tool. "
             "Never diagnose, recommend treatment, execute orders, or write to the "
             "chart. "
+            "Never post payments or take external actions. EOB adjudication is "
+            "not internal payment-posting evidence. Do not invent balances, "
+            "remittances, contract rates, or posting status. Disclose tool errors "
+            "and missing financial evidence and require human review. "
             "Distinguish no returned records from absence of "
             "history, and disclose uncertainty or incomplete evidence. If a "
             "question is ambiguous, ask a clarifying question instead of guessing. "
@@ -508,11 +661,11 @@ async def _ask_model(
             "in the answer string. The application displays sources separately."
         ),
     }
-    request_messages: list[dict[str, str]] = [
+    request_messages: ResponseInputParam = [
         system_message,
-        *[message.model_dump() for message in messages],
+        *[_chat_input_message(message) for message in messages],
     ]
-    tool: dict[str, Any] = {
+    tool: FunctionToolParam = {
         "type": "function",
         "name": "get_patient_chart",
         "description": (
@@ -524,21 +677,49 @@ async def _ask_model(
             "properties": {},
             "additionalProperties": False,
         },
+        "strict": True,
     }
+    tools: list[ToolParam] = [tool]
+    tool_handlers = {"get_patient_chart": retrieve_chart}
+    if retrieve_claims is not None:
+        tools.append(
+            {
+                "type": "function",
+                "name": "get_patient_claims",
+                "description": (
+                    "Read all available dates of Epic sandbox claims for the "
+                    "selected patient. Returns EOB amounts and limitations, "
+                    "not internal posting status or remittance evidence."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": False,
+                },
+                "strict": True,
+            }
+        )
+        tool_handlers["get_patient_claims"] = retrieve_claims
 
     async with AsyncOpenAI(**client_options) as client:
         tool_calls_used = 0
         chart_retrieved = False
         previous_response_id: str | None = None
-        next_input: list[dict[str, str]] | None = request_messages
+        next_input: ResponseInputParam = request_messages
+        reasoning: Reasoning | None
+        reasoning_effort = settings.model_reasoning_effort
+        if reasoning_effort == "none":
+            reasoning = None
+        else:
+            reasoning = {"effort": reasoning_effort}
         for _ in range(MAX_MODEL_TOOL_CALLS):
             response = await client.responses.create(
                 model=settings.model_name,
                 input=next_input,
                 previous_response_id=previous_response_id,
-                tools=[tool],
+                tools=tools,
                 tool_choice="required" if not chart_retrieved else "auto",
-                reasoning={"effort": settings.model_reasoning_effort},
+                reasoning=reasoning,
                 text={
                     "format": {
                         "type": "json_schema",
@@ -603,9 +784,9 @@ async def _ask_model(
             tool_calls_used += len(calls)
             if tool_calls_used > MAX_MODEL_TOOL_CALLS:
                 raise ValueError("The model requested too many chart tool calls.")
-            outputs: list[dict[str, str]] = []
+            outputs: ResponseInputParam = []
             for call in calls:
-                if call.name != "get_patient_chart":
+                if call.name not in tool_handlers:
                     raise ValueError("The model requested an unregistered FHIR tool.")
                 arguments = json.loads(call.arguments or "{}")
                 if not isinstance(arguments, dict) or arguments:
@@ -614,7 +795,7 @@ async def _ask_model(
                     raise ValueError(
                         "The configured model returned a tool call without an ID."
                     )
-                result = await retrieve_chart()
+                result = await tool_handlers[call.name]()
                 chart_retrieved = True
                 outputs.append(
                     {
