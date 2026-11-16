@@ -1,5 +1,7 @@
-import Chat from "@/components/chat";
+import PatientChatWorkspace from "@/components/patient-chat-workspace";
+
+export const dynamic = "force-dynamic";
 
 export default function ChatPage() {
-  return <Chat />;
+  return <PatientChatWorkspace />;
 }

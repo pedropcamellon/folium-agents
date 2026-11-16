@@ -27,6 +27,39 @@ _SAFE_FAILURE_CODES = {
     "Authorized Epic patient did not match selected context.": "oauth_patient_mismatch",
     "Epic returned a token without a valid lifetime.": "oauth_token_lifetime_invalid",
 }
+_FHIR_ISSUE_CODES = frozenset(
+    {
+        "invalid",
+        "structure",
+        "required",
+        "value",
+        "invariant",
+        "security",
+        "login",
+        "unknown",
+        "expired",
+        "forbidden",
+        "suppressed",
+        "processing",
+        "not-supported",
+        "duplicate",
+        "multiple-matches",
+        "not-found",
+        "deleted",
+        "too-costly",
+        "business-rule",
+        "conflict",
+        "transient",
+        "lock-error",
+        "no-store",
+        "exception",
+        "timeout",
+        "incomplete",
+        "throttled",
+        "informational",
+    }
+)
+_FHIR_ISSUE_SEVERITIES = frozenset({"fatal", "error", "warning"})
 
 
 def diagnostic(
@@ -38,6 +71,28 @@ def diagnostic(
         failure_code = _SAFE_FAILURE_CODES.get(str(error))
         if failure_code is not None:
             fields["failure_code"] = failure_code
+        issue_codes: set[str] = set()
+        issue_severities: set[str] = set()
+        cause: BaseException | None = error
+        visited: set[int] = set()
+        while cause is not None and id(cause) not in visited:
+            visited.add(id(cause))
+            issue_codes.update(
+                code
+                for code in getattr(cause, "provider_issue_codes", ())
+                if isinstance(code, str) and code in _FHIR_ISSUE_CODES
+            )
+            issue_severities.update(
+                severity
+                for severity in getattr(cause, "provider_issue_severities", ())
+                if isinstance(severity, str)
+                and severity in _FHIR_ISSUE_SEVERITIES
+            )
+            cause = cause.__cause__ or cause.__context__
+        if issue_codes:
+            fields["provider_issue_codes"] = sorted(issue_codes)
+        if issue_severities:
+            fields["provider_issue_severities"] = sorted(issue_severities)
         response = getattr(error, "response", None)
         if response is not None:
             status = getattr(response, "status_code", status)

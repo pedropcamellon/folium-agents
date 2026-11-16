@@ -11,22 +11,47 @@ from pydantic import BaseModel, ConfigDict
 from folium_agents.core.connections import connection_store
 from folium_agents.core.diagnostics import diagnostic
 from folium_agents.core.ehr import (
+    PATIENT_SEARCH_SESSION_TTL_SECONDS,
+    AuthorizationExpired,
     AuthorizationRequest,
     ChartEvidence,
     EHRConnectionStatus,
     EvidenceRecord,
     PatientDemographics,
+    PatientSearchAuthorizationExpired,
+    PatientSearchCandidate,
+    PatientSearchCriteria,
+    PatientSearchDenied,
+    PatientSearchFailed,
+    PatientSearchRejected,
+    PatientSearchResult,
 )
-from folium_agents.epic.epic import MEDICATION_REVIEW_SCOPE, EpicConfig, EpicSmartClient
-from folium_agents.epic.financial_reads import (
+from folium_agents.core.financial import (
+    ClaimAuthorizationExpired,
     ClaimSearch,
+    ClaimSearchError,
+)
+from folium_agents.epic.epic import (
+    DEFAULT_EPIC_SCOPE,
+    MEDICATION_REVIEW_SCOPE,
+    EpicConfig,
+    EpicPatientSearchNoResults,
+    EpicPatientSearchRejected,
+    EpicSmartClient,
+)
+from folium_agents.epic.financial_reads import (
+    FinancialReadError,
     search_claims,
     validate_claim_search_scope,
 )
-from folium_agents.epic.models import EpicToken, SmartConfiguration
+from folium_agents.epic.models import (
+    EpicPatientSearchResult,
+    EpicToken,
+    SmartConfiguration,
+)
 
 
-class EpicReauthorizationRequired(ValueError):
+class EpicReauthorizationRequired(AuthorizationExpired, ClaimAuthorizationExpired):
     pass
 
 
@@ -52,11 +77,22 @@ class EpicSession:
     connection_expires_at: float = 0
 
 
+@dataclass
+class EpicPatientSearchSession:
+    smart: SmartConfiguration
+    state: str
+    verifier: str
+    token: EpicToken | None = None
+    expires_at: float | None = None
+    connection_expires_at: float = 0
+
+
 class EpicConnector:
     name = "epic"
 
     def __init__(self) -> None:
         self._sessions: dict[str, EpicSession] = {}
+        self._patient_search_sessions: dict[str, EpicPatientSearchSession] = {}
         self._store = connection_store()
         self._refresh_lock = asyncio.Lock()
 
@@ -105,6 +141,110 @@ class EpicConnector:
             connection_expires_at=time.time() + 24 * 60 * 60,
         )
         return AuthorizationRequest(state=state, authorization_url=authorization_url)
+
+    async def start_patient_search_authorization(
+        self,
+        session_id: str,
+    ) -> AuthorizationRequest:
+        config = self._patient_search_config()
+        client = EpicSmartClient(config)
+        smart = await client.discover()
+        state = client.create_state()
+        verifier, challenge = client.create_pkce_pair()
+        authorization_url = client.build_authorization_url(
+            smart,
+            state=state,
+            code_challenge=challenge,
+        )
+        self._patient_search_sessions[session_id] = EpicPatientSearchSession(
+            smart=smart,
+            state=state,
+            verifier=verifier,
+            connection_expires_at=time.time() + PATIENT_SEARCH_SESSION_TTL_SECONDS,
+        )
+        return AuthorizationRequest(state=state, authorization_url=authorization_url)
+
+    async def complete_patient_search_authorization(
+        self,
+        session_id: str,
+        *,
+        state: str,
+        code: str,
+    ) -> None:
+        session = self._patient_search_session(session_id)
+        if not secrets.compare_digest(session.state, state):
+            raise ValueError("OAuth state mismatch; refusing token exchange.")
+        token = await EpicSmartClient(self._patient_search_config()).exchange_code(
+            session.smart,
+            code=code,
+            returned_state=state,
+            expected_state=session.state,
+            code_verifier=session.verifier,
+        )
+        session.expires_at = time.time() + self._validate_search_token(token)
+        session.token = token
+        session.verifier = ""
+        session.state = ""
+
+    async def search_patient_candidates(
+        self,
+        session_id: str,
+        criteria: PatientSearchCriteria,
+    ) -> PatientSearchResult:
+        session = self._patient_search_session(session_id)
+        try:
+            token = await self._patient_search_access_token(session)
+        except EpicReauthorizationRequired as error:
+            raise PatientSearchAuthorizationExpired(str(error)) from error
+        try:
+            self._validate_patient_search_scope(token.scope)
+        except EpicReauthorizationRequired as error:
+            raise PatientSearchAuthorizationExpired(str(error)) from error
+        try:
+            result = await EpicSmartClient(
+                self._patient_search_config()
+            ).search_patients(
+                token.access_token,
+                patient_id=criteria.patient_id,
+                given_name=criteria.given_name,
+                family_name=criteria.family_name,
+                birthdate=criteria.birth_date,
+            )
+        except EpicPatientSearchNoResults as error:
+            diagnostic("fhir.patient_search_no_results", error=error)
+            result = EpicPatientSearchResult(total=0, patients=[])
+        except EpicPatientSearchRejected as error:
+            raise PatientSearchRejected(
+                "The provider rejected the patient search. Check its search "
+                "requirements and Patient.Search access."
+            ) from error
+        except httpx.HTTPStatusError as error:
+            if error.response.status_code == 401:
+                session.token = None
+                session.expires_at = None
+                raise PatientSearchAuthorizationExpired(
+                    "Patient-search authorization expired. Connect again."
+                ) from error
+            if error.response.status_code == 403:
+                raise PatientSearchDenied(
+                    "The provider did not authorize patient search."
+                ) from error
+            if error.response.status_code == 400:
+                raise PatientSearchRejected(
+                    "The provider rejected the patient search. Check its search "
+                    "requirements and Patient.Search access."
+                ) from error
+            raise PatientSearchFailed(
+                "The provider could not complete the patient search."
+            ) from error
+        except (httpx.HTTPError, TimeoutError) as error:
+            raise PatientSearchFailed(
+                "The provider could not complete the patient search."
+            ) from error
+        return patient_search_result(result)
+
+    def end_patient_search_session(self, session_id: str) -> None:
+        self._patient_search_sessions.pop(session_id, None)
 
     async def complete_authorization(
         self,
@@ -224,17 +364,28 @@ class EpicConnector:
             ),
         )
 
-    async def search_patient_claims(self, session_id: str) -> ClaimSearch:
+    async def search_patient_claims(
+        self,
+        session_id: str,
+        patient_id: str,
+    ) -> ClaimSearch:
         session = self._session(session_id)
+        self._validate_patient(session, patient_id)
         token = await self._access_token(session)
-        validate_claim_search_scope(token.scope)
+        try:
+            validate_claim_search_scope(token.scope)
+        except FinancialReadError as error:
+            raise ClaimSearchError(str(error)) from error
         async with httpx.AsyncClient() as client:
-            return await search_claims(
-                issuer=self._config().issuer,
-                access_token=token.access_token,
-                patient_id=session.patient_id,
-                client=client,
-            )
+            try:
+                return await search_claims(
+                    issuer=self._config().issuer,
+                    access_token=token.access_token,
+                    patient_id=patient_id,
+                    client=client,
+                )
+            except FinancialReadError as error:
+                raise ClaimSearchError(str(error)) from error
 
     def end_session(self, session_id: str) -> None:
         self._sessions.pop(session_id, None)
@@ -244,6 +395,89 @@ class EpicConnector:
     async def _access_token(self, session: EpicSession) -> EpicToken:
         async with self._refresh_lock:
             return await self._refresh_token(session)
+
+    async def _patient_search_access_token(
+        self,
+        session: EpicPatientSearchSession,
+    ) -> EpicToken:
+        async with self._refresh_lock:
+            token = session.token
+            if (
+                token is not None
+                and session.expires_at is not None
+                and session.expires_at > time.time() + 30
+            ):
+                return token
+            if token is None or not token.refresh_token:
+                session.token = None
+                session.expires_at = None
+                raise EpicReauthorizationRequired(
+                    "Epic patient search authorization expired. Reconnect to search."
+                )
+            try:
+                refreshed = await EpicSmartClient(
+                    self._patient_search_config()
+                ).refresh_access_token(session.smart, token.refresh_token)
+            except httpx.HTTPStatusError as error:
+                if error.response.status_code in {400, 401}:
+                    session.token = None
+                    session.expires_at = None
+                    raise EpicReauthorizationRequired(
+                        "Epic patient search authorization expired. Reconnect to search."
+                    ) from error
+                raise
+            if refreshed.scope is None:
+                refreshed.scope = token.scope
+            if refreshed.refresh_token is None:
+                refreshed.refresh_token = token.refresh_token
+            session.expires_at = time.time() + self._validate_search_token(refreshed)
+            session.token = refreshed
+            return refreshed
+
+    def _patient_search_session(
+        self,
+        session_id: str,
+    ) -> EpicPatientSearchSession:
+        session = self._patient_search_sessions.get(session_id)
+        if session is None:
+            raise EpicReauthorizationRequired(
+                "Epic patient search authorization is unavailable. Reconnect to search."
+            )
+        if session.connection_expires_at <= time.time():
+            self.end_patient_search_session(session_id)
+            raise EpicReauthorizationRequired(
+                "Epic patient search authorization expired. Reconnect to search."
+            )
+        return session
+
+    @staticmethod
+    def _validate_search_token(token: EpicToken) -> int:
+        if token.patient is not None:
+            raise EpicReauthorizationRequired(
+                "Epic patient search requires a provider-context authorization."
+            )
+        if token.expires_in is None or token.expires_in <= 0:
+            raise EpicReauthorizationRequired(
+                "Epic patient search authorization is invalid. Reconnect to search."
+            )
+        EpicConnector._validate_patient_search_scope(token.scope)
+        return token.expires_in
+
+    @staticmethod
+    def _validate_patient_search_scope(scope: str | None) -> None:
+        if scope is None:
+            return
+        granted = set(scope.split())
+        has_read = bool(
+            {"user/Patient.rs", "user/Patient.read", "user/Patient.r"} & granted
+        )
+        has_search = bool(
+            {"user/Patient.rs", "user/Patient.read", "user/Patient.s"} & granted
+        )
+        if not has_read or not has_search:
+            raise EpicReauthorizationRequired(
+                "Epic authorization is missing Patient read and search permissions."
+            )
 
     async def _refresh_token(self, session: EpicSession) -> EpicToken:
         if (
@@ -375,6 +609,29 @@ class EpicConnector:
             update={"scope": MEDICATION_REVIEW_SCOPE}
         )
 
+    @staticmethod
+    def _patient_search_config() -> EpicConfig:
+        return EpicConnector._config().model_copy(update={"scope": DEFAULT_EPIC_SCOPE})
+
 
 def create_connector() -> EpicConnector:
     return EpicConnector()
+
+
+def patient_search_result(result: EpicPatientSearchResult) -> PatientSearchResult:
+    candidates = []
+    for patient in result.patients:
+        name = patient.primary_name
+        candidates.append(
+            PatientSearchCandidate(
+                patient_id=patient.id,
+                given_name=" ".join(name.given).strip() or None if name else None,
+                family_name=name.family.strip() or None if name else None,
+                birth_date=patient.birth_date,
+            )
+        )
+    return PatientSearchResult(
+        candidates=candidates,
+        total=result.total,
+        more_matches_available=result.more_matches_available,
+    )

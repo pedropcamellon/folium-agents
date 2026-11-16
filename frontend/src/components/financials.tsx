@@ -2,6 +2,7 @@
 
 import { useRef, useState } from "react";
 import EpicFinancialClaims from "@/components/epic-financial-claims";
+import { Button } from "@/components/ui/button";
 import {
   listFinancialClaims,
   investigateClaim,
@@ -37,7 +38,10 @@ export default function Financials({
     <div>
       <label>
         Financial data source
-        <select value={source} onChange={(event) => setSource(event.target.value)}>
+        <select
+          value={source}
+          onChange={(event) => setSource(event.target.value)}
+        >
           <option value="epic">Epic sandbox</option>
           <option value="synthetic">Local synthetic demo</option>
         </select>
@@ -126,7 +130,7 @@ function SyntheticFinancials({
       {loadError && (
         <p role="alert">
           {loadError}{" "}
-          <button onClick={reloadClaims}>Retry loading claims</button>
+          <Button onClick={reloadClaims}>Retry loading claims</Button>
         </p>
       )}
       <label htmlFor="claim">Synthetic claim </label>
@@ -143,9 +147,9 @@ function SyntheticFinancials({
           </option>
         ))}
       </select>
-      <button disabled={!selected || pending !== null} onClick={start}>
+      <Button disabled={!selected || pending !== null} onClick={start}>
         {pending ? "Investigating…" : "Investigate Claim"}
-      </button>
+      </Button>
       <div aria-live="polite">
         {pending && (
           <p>

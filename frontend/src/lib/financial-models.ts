@@ -1,4 +1,4 @@
-export type EpicClaimEvidence = {
+export type ClaimEvidence = {
   claimId: string;
   status: string;
   created: string;
@@ -11,12 +11,11 @@ export type EpicClaimEvidence = {
   postingStatus: "unknown";
 };
 
-export type EpicClaimSearch = {
-  source: "epic-sandbox";
+export type PatientClaimSearch = {
+  source: string;
   patientId: string;
-  claims: EpicClaimEvidence[];
+  claims: ClaimEvidence[];
   pages: number;
   complete: boolean;
-  grantedScope: string | null;
   limitations: string[];
 };

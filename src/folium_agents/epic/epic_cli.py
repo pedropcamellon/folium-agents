@@ -5,12 +5,15 @@ import os
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from threading import Event, Thread
+from typing import Protocol
 from urllib.parse import parse_qs, urlparse
 
 import httpx
 from rich.console import Console
 from rich.table import Table
 
+from folium_agents.core.ehr import PatientSearchCriteria
+from folium_agents.epic.adapter import patient_search_result
 from folium_agents.epic.epic import (
     MEDICATION_REVIEW_SCOPE,
     EpicConfig,
@@ -18,10 +21,49 @@ from folium_agents.epic.epic import (
     EpicTokenCache,
 )
 from folium_agents.epic.models import (
+    CachedEpicToken,
     EpicMedicationSafetyReview,
     EpicToken,
     SmartConfiguration,
 )
+
+
+class _MedicationReviewClient(Protocol):
+    def create_state(self) -> str: ...
+
+    def create_pkce_pair(self) -> tuple[str, str]: ...
+
+    def build_authorization_url(
+        self,
+        smart: SmartConfiguration,
+        *,
+        state: str,
+        code_challenge: str,
+    ) -> str: ...
+
+    async def exchange_code(
+        self,
+        smart: SmartConfiguration,
+        *,
+        code: str,
+        returned_state: str,
+        expected_state: str,
+        code_verifier: str,
+    ) -> EpicToken: ...
+
+    async def refresh_access_token(
+        self,
+        smart: SmartConfiguration,
+        refresh_token: str,
+    ) -> EpicToken: ...
+
+
+class _EpicTokenCache(Protocol):
+    def load(self) -> CachedEpicToken | None: ...
+
+    def save(self, token: EpicToken) -> None: ...
+
+    def clear(self) -> None: ...
 
 
 def _read_epic_callback(authorization_url: str, redirect_uri: str) -> dict[str, str]:
@@ -166,18 +208,23 @@ async def list_epic_patients(patient_id: str, console: Console) -> None:
         token = await _authorize_epic(client, smart, config)
         token_cache.save(token)
 
-    result = await client.search_patients(
+    criteria = PatientSearchCriteria(patient_id=patient_id)
+    provider_result = await client.search_patients(
         token.access_token,
-        patient_id=patient_id,
+        patient_id=criteria.patient_id,
     )
+    result = patient_search_result(provider_result)
 
     table = Table(
-        title=f"Epic sandbox Patient search ({len(result.patients)} returned)"
+        title=f"Epic sandbox Patient search ({len(result.candidates)} returned)"
     )
     table.add_column("Patient ID", style="cyan")
     table.add_column("Name")
-    for patient in result.patients:
-        table.add_row(patient.id, patient.display_name)
+    for candidate in result.candidates:
+        display_name = " ".join(
+            name for name in (candidate.given_name, candidate.family_name) if name
+        )
+        table.add_row(candidate.patient_id, display_name or "(name unavailable)")
     console.print(table)
 
 
@@ -207,10 +254,10 @@ async def review_patient_medications(patient_id: str, console: Console) -> None:
 
 
 async def _get_medication_review_token(
-    client: EpicSmartClient,
+    client: _MedicationReviewClient,
     smart: SmartConfiguration,
     config: EpicConfig,
-    token_cache: EpicTokenCache,
+    token_cache: _EpicTokenCache,
     patient_id: str,
     console: Console,
 ) -> EpicToken:
@@ -366,7 +413,7 @@ def _display_medication_review(
 
 
 async def _authorize_epic(
-    client: EpicSmartClient,
+    client: _MedicationReviewClient,
     smart: SmartConfiguration,
     config: EpicConfig,
 ) -> EpicToken:

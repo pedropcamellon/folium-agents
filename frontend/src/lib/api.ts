@@ -1,4 +1,4 @@
-import type { EpicClaimSearch } from "@/lib/financial-models";
+import type { PatientClaimSearch } from "@/lib/financial-models";
 
 export type ChatSource = {
   sourceType: string;
@@ -19,6 +19,13 @@ export type ChatResponse = {
 export type ConnectionStatus = {
   connected: boolean;
   patientId: string;
+  authorizationState: "authorized" | "authorization_required";
+  supportedOperations: ("patient_search" | "patient_chat" | "claims")[];
+};
+
+export type EHRProviderInfo = {
+  providerId: string;
+  supportedOperations: ("patient_search" | "patient_chat" | "claims")[];
 };
 
 export type PatientProfile = {
@@ -26,6 +33,19 @@ export type PatientProfile = {
   givenName: string | null;
   familyName: string | null;
   birthDate: string | null;
+};
+
+export type PatientSearchCandidate = {
+  patientId: string;
+  givenName: string | null;
+  familyName: string | null;
+  birthDate: string | null;
+};
+
+export type PatientSearchResponse = {
+  candidates: PatientSearchCandidate[];
+  total: number | null;
+  moreMatchesAvailable: boolean;
 };
 
 export class ApiRequestError extends Error {
@@ -80,12 +100,16 @@ function getApiBaseUrl(): string {
 }
 
 type ApiOperation =
+  | "list_providers"
   | "chat"
   | "patient"
   | "disconnect"
+  | "authorize_patient_search"
+  | "search_patients"
+  | "disconnect_patient_search"
   | "authorize"
   | "restore"
-  | "search_epic_claims"
+  | "search_patient_claims"
   | "list_financial_claims"
   | "investigate_claim";
 
@@ -152,6 +176,10 @@ async function request<T>(
   return (await response.json()) as T;
 }
 
+export function listEHRProviders() {
+  return request<EHRProviderInfo[]>("list_providers", "/api/providers");
+}
+
 export type FinancialClaim = {
   claimId: string;
   workspaceId: string;
@@ -189,9 +217,9 @@ export function listFinancialClaims() {
   );
 }
 
-export function searchEpicClaims(sessionId: string) {
-  return request<EpicClaimSearch>(
-    "search_epic_claims",
+export function searchPatientClaims(sessionId: string) {
+  return request<PatientClaimSearch>(
+    "search_patient_claims",
     `/api/sessions/${encodeURIComponent(sessionId)}/financial/claims`,
   );
 }
@@ -213,6 +241,41 @@ export async function createSession(patientId: string) {
     method: "POST",
     body: JSON.stringify({ patientId }),
   });
+}
+
+export function createPatientSearchSession() {
+  return request<{
+    sessionId: string;
+    authorizationUrl: string;
+  }>("authorize_patient_search", "/api/patient-search/sessions", {
+    method: "POST",
+  });
+}
+
+export function searchPatients(
+  sessionId: string,
+  criteria: {
+    givenName: string;
+    familyName: string;
+    birthDate: string;
+  },
+) {
+  return request<PatientSearchResponse>(
+    "search_patients",
+    `/api/patient-search/sessions/${encodeURIComponent(sessionId)}/search`,
+    {
+      method: "POST",
+      body: JSON.stringify(criteria),
+    },
+  );
+}
+
+export function clearPatientSearchSession(sessionId: string) {
+  return request<void>(
+    "disconnect_patient_search",
+    `/api/patient-search/sessions/${encodeURIComponent(sessionId)}`,
+    { method: "DELETE" },
+  );
 }
 
 export function getConnectionStatus(sessionId: string) {

@@ -121,20 +121,30 @@ class EpicPatient(BaseModel):
 
 
 class PatientBundleEntry(BaseModel):
-    resource: EpicPatient
+    resource: dict[str, Any]
 
 
 class EpicPatientSearchResult(BaseModel):
     total: int | None = None
     patients: list[EpicPatient]
+    more_matches_available: bool = False
+
+
+class EpicPatientBundleLink(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    relation: str
+    url: str
 
 
 class EpicPatientBundle(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     resource_type: Literal["Bundle"] = Field(alias="resourceType")
+    bundle_type: str = Field(alias="type")
     total: int | None = None
     entry: list[PatientBundleEntry] = Field(default_factory=list)
+    link: list[EpicPatientBundleLink] = Field(default_factory=list)
 
 
 class FhirCoding(BaseModel):

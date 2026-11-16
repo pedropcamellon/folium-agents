@@ -7,36 +7,17 @@ from urllib.parse import parse_qs, urljoin, urlsplit
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+from folium_agents.core.financial import (
+    ClaimAmount,
+    ClaimEvidence,
+    ClaimSearch,
+    ClaimSearchError,
+)
 from folium_agents.epic.epic import DEFAULT_EPIC_FHIR_ISSUER
 from folium_agents.epic.models import FhirOperationOutcome
-from folium_agents.financial import Contract
 
 MAX_PAGES = 10
 MAX_RECORDS = 1000
-
-
-class ClaimAmount(Contract):
-    category: str
-    value: str
-    currency: str | None
-
-
-class ClaimEvidence(Contract):
-    claim_id: str
-    status: str
-    created: str
-    source_id: str
-    amounts: list[ClaimAmount]
-    posting_status: Literal["unknown"] = "unknown"
-
-
-class ClaimSearch(Contract):
-    source: Literal["epic-sandbox"] = "epic-sandbox"
-    patient_id: str
-    claims: list[ClaimEvidence]
-    pages: int
-    complete: bool
-    limitations: list[str]
 
 
 class FhirMoney(BaseModel):
@@ -90,7 +71,7 @@ class SearchBundle(BaseModel):
     total: int | None = Field(default=None, ge=0)
 
 
-class FinancialReadError(ValueError):
+class FinancialReadError(ClaimSearchError):
     pass
 
 
@@ -321,6 +302,7 @@ async def search_claims(
                         "Epic result count is inconsistent; coverage is incomplete."
                     )
                 return ClaimSearch(
+                    source="epic-sandbox",
                     patient_id=patient_id,
                     claims=list(claims.values()),
                     pages=page,
