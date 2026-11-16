@@ -166,6 +166,7 @@ textarea {
   color: #40566d;
   font-size: 0.84rem;
   font-weight: 700;
+  text-decoration: none;
 }
 
 .ehr-nav .nav-item:hover:not(:disabled) {
